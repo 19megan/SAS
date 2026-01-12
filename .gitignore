@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyd
 *.so
+*.pkl
 
 # Jupyter
 .ipynb_checkpoints/
