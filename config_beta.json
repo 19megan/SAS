@@ -1,0 +1,33 @@
+{
+
+
+"sas_specs" : {
+    "Q out [vol/time]":
+                 {"reach":
+                      {"scipy.stats": "beta",
+                       "args": { "a": "a_b",
+                                 "b": "b_b",
+                                 "scale": "S_b",
+                                 "loc": "S_min" },
+                       "nsegment": 500
+                       }
+                       }
+                    },
+	
+	
+"solute_parameters": {
+
+	"C [conc]": {"C_old": 0.5}
+
+	},
+	
+
+"options": {
+
+	"dt": 0.01,
+	"influx": "J in [vol/time]",
+	"record_state": true
+	
+	}
+	
+}

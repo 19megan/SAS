@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyd
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environments
+.env
+venv/
+*.conda
+
+# SAS / compiled
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db

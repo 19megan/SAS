@@ -1,0 +1,31 @@
+{
+
+
+ "sas_specs": {
+  	"Q DS [L/s]": {
+        "my reach SAS": {
+            "ST": [100, 150, 400],
+            "P": [0.0, 0.5, 1.0]
+            }
+            }
+        },
+
+	
+	
+"solute_parameters": {
+
+	"Upstream conc. [mg/L]": {
+      "C_old": 10.96
+  }
+},
+	
+
+"options": {
+
+	"influx": "Q US [L/s]",
+    "dt": 60,
+	"record_state": true
+	
+	}
+	
+}

@@ -1,0 +1,3 @@
+cc3e15cf37a7e7b707d057821965b80e    data/contents/HJA_data.csv
+d2e728eaadb919eefa12213d82176895    data/resourcemap.xml
+73affba55746a10d2ef8575810338843    data/resourcemetadata.xml

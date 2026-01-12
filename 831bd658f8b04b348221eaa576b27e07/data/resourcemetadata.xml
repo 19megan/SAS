@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rdf:RDF
+  xmlns:dc="http://purl.org/dc/elements/1.1/"
+  xmlns:hsterms="https://www.hydroshare.org/terms/"
+  xmlns:dcterms="http://purl.org/dc/terms/"
+  xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+>
+  <hsterms:CompositeResource rdf:about="http://www.hydroshare.org/resource/831bd658f8b04b348221eaa576b27e07">
+    <dc:type>
+      <rdf:Description rdf:about="http://www.hydroshare.org/terms/CompositeResource">
+        <rdfs:label>Composite Resource</rdfs:label>
+        <rdfs:isDefinedBy rdf:resource="https://www.hydroshare.org/terms/"/>
+      </rdf:Description>
+    </dc:type>
+    <dc:title>StorAge Selection (SAS) and mesas.py : A gentle introduction -- Example data</dc:title>
+    <dc:subject>HydroLearn</dc:subject>
+    <dc:subject>isotope</dc:subject>
+    <dc:description>
+      <rdf:Description>
+        <dcterms:abstract>Data files for use in conjunction with HydroLearn course 'StorAge Selection (SAS) and mesas.py : A gentle introduction'&#13;
+&#13;
+Course is available here: https://edx.hydrolearn.org/courses/course-v1:JHU+570.412+Sp2020</dcterms:abstract>
+      </rdf:Description>
+    </dc:description>
+    <dcterms:bibliographicCitation>Harman, C. (2020). StorAge Selection (SAS) and mesas.py : A gentle introduction -- Example data, HydroShare, http://www.hydroshare.org/resource/831bd658f8b04b348221eaa576b27e07</dcterms:bibliographicCitation>
+    <dc:subject>tracers</dc:subject>
+    <dc:identifier>
+      <rdf:Description>
+        <hsterms:hydroShareIdentifier rdf:resource="http://www.hydroshare.org/resource/831bd658f8b04b348221eaa576b27e07"/>
+      </rdf:Description>
+    </dc:identifier>
+    <dc:date>
+      <dcterms:created>
+        <rdf:value>2020-08-05T14:05:55.309132+00:00</rdf:value>
+      </dcterms:created>
+    </dc:date>
+    <dc:date>
+      <dcterms:modified>
+        <rdf:value>2020-08-05T14:10:21.986324+00:00</rdf:value>
+      </dcterms:modified>
+    </dc:date>
+    <dc:rights>
+      <rdf:Description>
+        <hsterms:URL rdf:resource="http://creativecommons.org/licenses/by/4.0/"/>
+        <hsterms:rightsStatement>This resource is shared under the Creative Commons Attribution CC BY.</hsterms:rightsStatement>
+      </rdf:Description>
+    </dc:rights>
+    <dc:subject>StorAge Selection</dc:subject>
+    <dc:subject>mesas</dc:subject>
+    <dc:subject>SAS</dc:subject>
+    <dc:language>eng</dc:language>
+    <dc:creator>
+      <rdf:Description>
+        <hsterms:email>Ciaran.harman@gmail.com</hsterms:email>
+        <hsterms:creatorOrder rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">1</hsterms:creatorOrder>
+        <hsterms:hydroshare_user_id rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">3418</hsterms:hydroshare_user_id>
+        <hsterms:name>Harman, Ciaran</hsterms:name>
+        <hsterms:description rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">3418</hsterms:description>
+        <hsterms:organization>Johns Hopkins University</hsterms:organization>
+        <hsterms:phone></hsterms:phone>
+      </rdf:Description>
+    </dc:creator>
+  </hsterms:CompositeResource>
+</rdf:RDF>
