@@ -28,6 +28,7 @@ ax12.set_ylim([0,0.75])#max(max(data_df['rainfall (mm/hr)']), max(data_df['snowf
 ax12.invert_yaxis()
 ax1.set_title('ORPB Discharge and Rainfall')
 ax1.legend()
+ax12.legend()
 
 issample = np.logical_not(np.isnan(data_df['ORPB 18O']))
 ax2.plot(data_df.index[issample], 
@@ -61,12 +62,16 @@ plt.show()
 
 
 #%%
-data_df = data_df.loc[pd.Timestamp('2014-08-01'): pd.Timestamp('2015-08-31')] #subset to Putnam's data range 2014-08-01 - 2016-08-31
+# data_df = data_df.loc[pd.Timestamp('2014-08-01'): pd.Timestamp('2014-08-31')] #subset to Putnam's data range 2014-08-01 - 2016-08-31
 issample = np.logical_not(np.isnan(data_df['ORPB 18O']))
+#--------influx----------
+# df['influx (mm/hr)'] = df['rainfall (mm/hr)']
+# df['influx (mm/hr)'] = df[['rainfall (mm/hr)','snowfall SWE (mm/hr)','snowmelt (mm/hr)']].sum(axis=1)
+data_df['influx (mm/hr)'] = data_df[['rainfall (mm/hr)','snowmelt (mm/hr)']].sum(axis=1)
 
 data_df['quickflow (mm/hr)'] = data_df['discharge (mm/hr)'] - data_df['baseflow 1 (mm/hr)']
 data_df['bf1_weight'] = data_df['baseflow 1 (mm/hr)'] / data_df['discharge (mm/hr)']
-
+data_df['qf_weight'] = data_df['quickflow (mm/hr)'] / data_df['discharge (mm/hr)']
 
 # Find data where quickflow is small - from baseflow separation code in GenerateCleanData_v2.ipyb
 data_df["rain+melt (mm/hr)"] = data_df["rainfall (mm/hr)"] + data_df["snowmelt (mm/hr)"]
@@ -92,7 +97,8 @@ print(data_df.columns)
 
 # Check for nans
 print('Number of nans: ',len(data_df.loc[data_df['precip 18O'].isna()==True])) #1533 nan rows
-
+# diffs=data.loc[data['precip 18O'].isna()==True].index.to_series().diff()
+# diffs.value_counts() # check for frequency of gaps
 # decide on what to fill nans with
 #fill nas with either mean of data or nearest neighbor estimate
 
@@ -104,7 +110,9 @@ plt.title('precip 18O histogram')
 # fill nans with mean
 mean = data_df['precip 18O'].mean()
 df= data_df.copy() #make a copy of the data_df
-df.loc[df['precip 18O'].isna()==True, 'precip 18O']=mean
+# df.loc[df['precip 18O'].isna()==True, 'precip 18O']=mean
+# Instead of filling with mean, use forward/backward fill or interpolation
+df['precip 18O'] = df['precip 18O'].fillna(method='ffill').fillna(method='bfill')
 
 # assert positive ET values
 # df.loc[df['ET (mm/hr)']<0, 'ET (mm/hr)']=0
@@ -155,12 +163,13 @@ def make_beta_model_from(params): # for beta distribution
 # Note: dt must match the data timestep (1 hour here)
 def make_gamma_model_from(params): # for gamma distribution
     c18O_old, a, lamda, S_c, et_scale = params
-    df['S_scale'] = lamda*(df['storage (mm)']-S_c)
+    normalized_storage = df['storage (mm)']-df['storage (mm)'].mean()
+    df['S_scale'] = lamda*(normalized_storage-S_c) #slope and intercept 
     sas_specs = {'discharge (mm/hr)':
                      {'ORPB':
                           {'func': 'gamma',
                            'args': { 'a': a,
-                                 'scale': 'S_scale', #'abs_storage (mm)',
+                                 'scale': 'S_scale', #'abs_storage (mm)', #mean travel time
                                  'loc': 0 }}},
                  'ET (mm/hr)':
                      {'ET':
@@ -171,8 +180,34 @@ def make_gamma_model_from(params): # for gamma distribution
                                 'loc': 0.0,
                                 'scale': et_scale}}}
                 }
-    solute_parameters = {'precip 18O': {'C_old': c18O_old}} #add other solutes here and c_old can be calibration or mean
-    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)')
+    solute_parameters = {'precip 18O': {'C_old': c18O_old, 'observations': 'ORPB 18O'}}#{'discharge (mm/hr)': 'ORPB 18O'}}} #add other solutes here and c_old can be calibration or mean
+    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=True, verbose=True, n_substeps=1)
+
+def make_gamma_split_model_from(params): # split quickflow and baseflow with different SAS functions
+    c18O_old, a_qf, t_qf, a_bf, lamda, S_c, et_scale = params
+    df['S_scale'] = lamda*(df['storage (mm)']-S_c) #slope and intercept 
+    sas_specs = {'discharge (mm/hr)':
+                     {'qf_weight':
+                          {'func': 'gamma',
+                           'args': { 'a': a_qf,
+                                 'scale': t_qf,
+                                 'loc': 0 }},
+                      'bf1_weight':
+                          {'func': 'gamma',
+                           'args': { 'a': a_bf,
+                                 'scale': 'S_scale',
+                                 'loc': 0 }}},
+                 'ET (mm/hr)':
+                     {'ET':
+                          {'func': 'kumaraswamy',
+                           'args':{
+                                'a': 1.0,
+                                'b': 1.0,
+                                'loc': 0.0,
+                                'scale': et_scale}}}
+                }
+    solute_parameters = {'precip 18O': {'C_old': c18O_old, 'observations': 'ORPB 18O'}}
+    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=True, verbose=True, n_substeps=1)
 # gamma distribution for optimizing S_0 has different assumptions of the affect of storage with the shape of the SAS function
 # if using 'scipy.stats', then replace 'func' with 'scipy.stats' and function does not need ""
 def make_kumar_model_from(params): # for kumaraswamy distribution
@@ -228,15 +263,15 @@ def make_Putnam_model_from(params): # from Putnam Chapter 3
 # step-wise calibration of parameters to capture certain parts of variability
 # Function that builds SAS model and returns RMSE
 def minimize_me(params):
-   model = make_Putnam_model_from(params) #***edit which distribution to minimize***
+   model = make_gamma_model_from(params) #***edit which distribution to minimize***
    model.run()
-   obs = model.data_df['ORPB 18O'][isbaseflow].to_numpy() # for baseflow or quickflow
+#    obs = model.data_df['ORPB 18O'][isbaseflow].to_numpy() # for baseflow or quickflow
 #    pred = (1-model.data_df['bf1_weight'][isquickflow].to_numpy())*(model.data_df['precip 18O --> quickflow (mm/hr)'][isquickflow].to_numpy()) #for quickflow
-   pred = model.data_df['bf1_weight'][isbaseflow].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][isbaseflow].to_numpy()) # for baseflow
+#    pred = model.data_df['bf1_weight'][isbaseflow].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][isbaseflow].to_numpy()) # for baseflow
 
-#    obs = model.data_df['ORPB 18O'][issample].to_numpy() # for all data valid with ORPB 18O sample
+   obs = model.data_df['ORPB 18O'][issample].to_numpy() # for all data valid with ORPB 18O sample
 #    pred = (1-model.data_df['bf1_weight'][issample].to_numpy())*(model.data_df['precip 18O --> quickflow (mm/hr)'][issample].to_numpy()) + model.data_df['bf1_weight'][issample].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][issample].to_numpy())
-#    pred = model.data_df['precip 18O --> discharge (mm/hr)'] # for data not separated into qf and bf
+   pred = model.data_df['precip 18O --> discharge (mm/hr)'][issample] # for data not separated into qf and bf
    RMSE = np.sqrt(np.mean((pred-obs)**2))
    print(f'RMSE = {RMSE} for params = {params}')
    return RMSE
@@ -255,37 +290,76 @@ def maximize_me(params):
 
 #%%
 # -------------------Set parameters ----------------------------
-#--------influx----------
-# df['influx (mm/hr)'] = df['rainfall (mm/hr)']
-# df['influx (mm/hr)'] = df[['rainfall (mm/hr)','snowfall SWE (mm/hr)','snowmelt (mm/hr)']].sum(axis=1)
-df['influx (mm/hr)'] = df[['rainfall (mm/hr)','snowmelt (mm/hr)']].sum(axis=1)
 
 #--------storage----------
 # Now let's supply initial estimates of parameters #opt gamma rmse: 0.5374013865404, b-rmse: 0.53211672085
-S_0 = 5701.46684 # latest g-opt: 5701.46684, b-opt: 6245.18546 (mm) initial storage, can be set to any value
+# S_0 = 5701.46684 # latest g-opt: 5701.46684, b-opt: 6245.18546 (mm) initial storage, can be set to any value
 # Try keeping S_0 constant and optimizing other parameters
 
-df['abs_storage (mm)'] = df['storage (mm)'] + S_0 # (mm)
-S_min = df['storage (mm)'].min() # (mm)
-S_max = df['storage (mm)'].max() # (mm)
-df['wetness'] = (df['storage (mm)'] - S_min) / (S_max - S_min) # catchment wetness
+# df['abs_storage (mm)'] = df['storage (mm)'] + S_0 # (mm)
+# S_min = df['storage (mm)'].min() # (mm)
+# S_max = df['storage (mm)'].max() # (mm)
+# df['wetness'] = (df['storage (mm)'] - S_min) / (S_max - S_min) # catchment wetness
 
 #--------ET storage----------
-S_Tet = 0.02822 #0.58 # normalize to S_max-S_min = 1530.484 (mm)
-LnS_Tet = np.log(S_Tet) # optimize ln(S_Tet) to ensure S_Tet is always positive
-et_scale = 43.4542481 # (mm) from pmcmc
+# S_Tet = 0.02822 #0.58 # normalize to S_max-S_min = 1530.484 (mm)
+# LnS_Tet = np.log(S_Tet) # optimize ln(S_Tet) to ensure S_Tet is always positive
+et_scale = 40.827 #43.4542481 # (mm) from pmcmc
 
 #--------solute parameters----------
-c18O_old = -7.790043373 #normalize to -7.6 for Putnam model #df['precip 18O'].mean() -1 # latest g-opt: -7.65909, b-opt: -7.720487 (per mil)
+c18O_old = -7.6 #-7.3898 #-7.790043373 #normalize to -7.6 for Putnam model #df['precip 18O'].mean() -1 # latest g-opt: -7.65909, b-opt: -7.720487 (per mil)
 # 0.98*-7.6 = -7.44 for starting date 2014-08-01 (Putnam's subset)
 #--------distribution parameters--------
-a = 1.249941962 # laetest g-opt: 0.8293324, b-opt: 0.733789
-b = 0.9923319 #latest b-opt: 0.945078
-a_bf = 1.26 #(df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2 # mean^2/std^2 = (df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2
-t_bf = 1.48 #1.36-2.23 normalized to storage (df['baseflow 1 (mm/hr)'].std())**2/df['baseflow 1 (mm/hr)'].mean() #variance/mean, or should be mean storage that contains baseflow
-q_max = 1 #normalized to wetness
-lamda = -106.9838848
-S_c = 50.67889314
+a = 1.26 #1.26399 #1.249941962 # laetest g-opt: 0.8293324, b-opt: 0.733789
+# b = 0.9923319 #latest b-opt: 0.945078
+# a_bf = 1.26 #(df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2 # mean^2/std^2 = (df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2
+# t_bf = 1.48 #1.36-2.23 normalized to storage (df['baseflow 1 (mm/hr)'].std())**2/df['baseflow 1 (mm/hr)'].mean() #variance/mean, or should be mean storage that contains baseflow
+# q_max = 1 #normalized to wetness
+# lamda = -109.184 #-115.0382 #-106.9838848
+# S_c = 51.5895 #49.9052 #50.67889314
+
+# calculate realistic scale and lamda
+# S_scale = controls mean travel time and how it responds to storage, lamda = senstivity of transit time to storage, S_c = storage threshold where travel time begins to change ensure positivity by making storage>S_c so S_c<=min(storage)
+S_c=df['storage (mm)'].min()-50 #min(df['storage (mm)'])-50 # this is solid, should be less than dynamic storage
+lamda=.5 #12.1017 # 10/(df['storage (mm)'].median()-S_c) #median of storage is s_ref
+#%%
+# sscale=lamda*(scale-sc)
+# plt.plot(scale,sscale) #increase monotonically
+# plt.plot(data_df['storage (mm)'], sscale) # check that they increase
+# hard to tell if sscale is good for discharge, try binning by sscale
+# data_df['sscale']=sscale
+# df = data_df[['sscale', 'discharge (mm/hr)']].dropna()
+# df['Q'] = df['discharge (mm/hr)']
+# df['S_bin'] = pd.qcut(df['sscale'], q=10, duplicates='drop')
+#binned = (
+#     df
+#     .groupby('S_bin')
+#     .agg(
+#         S_scale_mid=('sscale', 'median'),
+#         Q_mean=('Q', 'mean'),
+#         Q_std=('Q', 'std'),
+#         Q_p90=('Q', lambda x: np.percentile(x, 90)),
+#         Q_p95=('Q', lambda x: np.percentile(x, 95)),
+#         n=('Q', 'size')
+#     )
+#     .reset_index()
+# )
+# variance test: should increase monotonically
+# plt.figure()
+# plt.plot(binned['S_scale_mid'], binned['Q_std'], marker='o')
+# plt.xlabel('S_scale')
+# plt.ylabel('std(Q)')
+# plt.title('Discharge variability vs storage scale')
+# plt.show()
+# upper-tail test: confirms scale behavior
+# plt.figure()
+# plt.plot(binned['S_scale_mid'], binned['Q_std'], marker='o')
+# plt.xlabel('S_scale')
+# plt.ylabel('std(Q)')
+# plt.title('Discharge variability vs storage scale')
+# plt.show()
+
+#%%
 #--------set params_init---------
 params_init = c18O_old, a, lamda, S_c, et_scale #***edit for distribution type***
 params=params_init
@@ -308,11 +382,80 @@ from scipy.optimize import fmin
 # Try basinhopping
 from scipy.optimize import basinhopping
 # params = basinhopping(maximize_me, params_init, niter=25, T=0.01)
-params = basinhopping(minimize_me, params_init, niter=25, T=0.01, stepsize=1)
-# KGE = 0.26530872637748615 for params = [  1.07765061   7.09109695  39.2271749  -37.28849388] # craxy params, [*-7.6, *1, *1, *1530]
-# KGE = 0.36201470716876416 for params = [ 1.09577435  4.99062377  0.57473554 63.21127996] # [*-7.6, *1, *1423.08, *1530.484]
-# KGE = 0.31210261485201396 for params = [1.13751803 1.21589436 1.0043737  0.04532525] # [*-7.6, *1, *1423.08, *1530.484]
-# RMSE = 0.7229818401498957 for params = [0.9845116 2.616227 1.1883285 1.23770101] # [*-7.6, *1, *1423.08, exp[.]*1530.484]
+params = basinhopping(minimize_me, params_init, niter=25, T=0.01, stepsize=0.1)
+
+#%%
+# ------------------Try Monte Carlo sampling----------------------
+from tqdm import tqdm
+normalized_storage = df['storage (mm)']-df['storage (mm)'].mean()
+R=normalized_storage.max()-normalized_storage.min()
+# param bounds
+# bounds = {# for gamma model
+#     "c18O_old": (-7.819719, -7.5),
+#     "a": (0.3, 5.0),
+#     "lamda": (0.01, 2), #(10, 13),
+#     "S_c": (int(normalized_storage.min()-.75*R), int(normalized_storage.min()-.05*R)), #(-300, -150), #(-330, -310), normlized storage to mean.min()-.75*range to just min-5, scale shrinks to 0 as catchment approaches extreme dryness
+#     "et_scale": (5, 100)
+# }
+bounds = {# for gamma split model
+    "c18O_old": (-7.8, -7.5),
+    "a_qf": (0.1, 1.0),      # quickflow: young water, shorter travel time
+    "t_qf": (0.1, 1.0),      # quickflow: young water, shorter travel time
+    "a_bf": (1.0, 5.0),      # baseflow: old water, longer travel time
+    "lamda": (0.01, 2.0),
+    "S_c": ((df['storage (mm)'].min()-.75*R), (df['storage (mm)'].min()-.05*R)), #(int(normalized_storage.min()-.75*R), int(normalized_storage.min()-.05*R)),
+    "et_scale": (5, 100)
+}
+param_names = list(bounds.keys())
+
+def sample_params(bounds):
+    return [np.random.uniform(low, high) for low, high in bounds.values()]
+
+def evaluate_model(params):
+    try:
+        model=make_gamma_split_model_from(params)
+        model.run()
+
+        obs = model.data_df['ORPB 18O'][issample].to_numpy()
+        pred = model.data_df['precip 18O --> discharge (mm/hr)'][issample].to_numpy()
+        if np.any(np.isnan(pred)) or np.any(np.isinf(pred)):
+            return np.nan
+        RMSE = np.sqrt(np.mean((pred-obs)**2))
+        return RMSE
+    except Exception as e: # catches unstable parameter combinations
+        return np.nan
+
+N = 100 #samples
+results = []
+for _ in tqdm(range(N)):
+    params = sample_params(bounds)
+    RMSE = evaluate_model(params)
+    if not np.isnan(RMSE):
+        results.append((params + [RMSE]))
+
+cols = param_names + ['RMSE']
+results_df = pd.DataFrame(results, columns=cols)
+print(results_df.describe())
+
+threshold = results_df['RMSE'].quantile(0.05) # top 5% of samples
+best = results_df[results_df['RMSE'] <= threshold]
+print("RMSE threshold: ", threshold)
+print(best.describe())
+
+
+#%%
+#extract results and visualize
+p = best.loc[best['RMSE']==best['RMSE'].min()]
+p = p.to_numpy()
+p = np.delete(p, -1) # take off RMSE column for params
+print(p)
+model = make_gamma_split_model_from(p) #***edit which distribution***
+model.run()
+
+best.hist(bins=20, figsize=(12, 8))
+plt.tight_layout()
+plt.legend()
+plt.show()
 #%%
 # ------------------Build the model --------------------
 # Now build a model with parameters
@@ -332,13 +475,13 @@ pickle.dump(model, open('Putnam_model_n1.01.50.950.2.pkl', 'wb'))
 # ------------------Visualize the output-------------------
 # data_df = model.data_df #don't forget to do this
 from mesas.utils import vis
-fig = plt.figure(figsize=[12,4])
+fig = plt.figure(figsize=[14,4])
 
 # plt.plot(isbaseflow, model.data_df['ORPB 18O'][isbaseflow],'-', label='Observed 18O baseflow')
 # pred = model.data_df['bf1_weight'][isbaseflow].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][isbaseflow].to_numpy())
 # plt.plot(isbaseflow, pred,'-', label='Predicted 18O baseflow')
 
-plt.plot(model.data_df.index[issample], model.data_df['ORPB 18O'][issample],'-', color='grey', label='Observed 18O outflow')
+plt.plot(model.data_df.index[issample], model.data_df['ORPB 18O'][issample],'.-', color='grey', label='Observed 18O outflow')
 
 # ----for quickflow/baseflow split
 # pred = (1-model.data_df['bf1_weight'][issample].to_numpy())*(model.data_df['precip 18O --> quickflow (mm/hr)'][issample].to_numpy()) + model.data_df['bf1_weight'][issample].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][issample].to_numpy())
@@ -347,8 +490,8 @@ plt.plot(model.data_df.index[issample], model.data_df['ORPB 18O'][issample],'-',
 # plt.plot(model.data_df.index[issample], model.data_df['precip 18O --> baseflow 1 (mm/hr)'][issample], label='Predicted 18O baseflow 1')
 
 # ----for combined discharge
-plt.plot(model.data_df.index, model.data_df['precip 18O --> discharge (mm/hr)'], '-', color='orange', label='Predicted 18O full discharge')
-plt.axvspan(pd.Timestamp('2014-10-01'), pd.Timestamp('2015-09-30'), color='lightgrey', alpha=0.5)
+plt.plot(model.data_df.index, model.data_df['precip 18O --> discharge (mm/hr)'], '.-', color='orange', alpha=0.3,label='Predicted 18O outflow')
+# plt.axvspan(pd.Timestamp('2014-10-01'), pd.Timestamp('2015-09-30'), color='lightgrey', alpha=0.5)
 # plt.axvspan(pd.Timestamp('2016-10-01'), pd.Timestamp('2017-09-30'), color='lightgrey', alpha=0.5)
 # plt.axvspan(pd.Timestamp('2018-10-01'), pd.Timestamp('2019-09-30'), color='lightgrey', alpha=0.5)
 plt.legend()
