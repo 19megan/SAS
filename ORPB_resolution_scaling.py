@@ -13,7 +13,7 @@ data = pd.read_csv('ORPB_isotope_data.csv', index_col=0, parse_dates=[0]) #len 5
 
 # clean up and find missing samples
 data = data.drop(data[data['Sample Name'].isna()].index)
-issample = ~data['Sample Name'].duplicated(keep='last')
+issample = ~data.loc[data['rainfall (mm/hr)']>0, 'Sample Name'].duplicated(keep='last')
 data['is_weekly'] = issample
 #%% ----------------stream isotopes-------------------------------------------------
 # note: if using stream isotopes, need to change the mass flux calculation to use discharge instead of precipitation
@@ -65,7 +65,13 @@ data['is_weekly'] = issample
 
 #%%-----------------precip isotopes-------------------------------------------------
 isotopes = data[['precip 2H', 'precip 18O', 'precip 17O']] # we want to scale the input isotopes
-iso = 'precip 18O' #'precip 2H'
+iso = 'precip 2H' #'precip 18O' #'precip 2H'
+if iso == 'precip 2H': #number of digits needed for isotope type
+    ison = 2
+elif iso == 'precip 18O':
+    ison = 3
+else:
+    ison = 3
 
 def weighted_average(df, col='precip 2H', agg_freq='W'):
     weighted_avg = df[col].mul(df['rainfall (mm/hr)']).resample(agg_freq).sum() / df['rainfall (mm/hr)'].resample(agg_freq).sum()
@@ -100,12 +106,12 @@ ax2.set_ylabel('Concentration [‰]')
 ax2.legend()
 ax2.set_title('ORPB Tracer in precipitation')
 
-isSsample = np.logical_not(np.isnan(data[f'ORPB {iso[-2:]}']))
+isSsample = np.logical_not(np.isnan(data[f'ORPB {iso[-ison:]}']))
 ax3.plot(data.index[isSsample],
-         data[f'ORPB {iso[-2:]}'][isSsample], '.', label=f'observed mixed freq ORPB {iso[-3:]}')
+         data[f'ORPB {iso[-ison:]}'][isSsample], '.', label=f'observed mixed freq ORPB {iso[-ison:]}')
 # aggregate using Esther Equation 4.1
-siso_agg = weighted_average(data[isSsample], col=f'ORPB {iso[-2:]}', agg_freq='W')
-ax3.plot(siso_agg.index, siso_agg, '.', markersize=7, label=f'weekly agg ORPB {iso[-3:]}')
+siso_agg = weighted_average(data[isSsample], col=f'ORPB {iso[-ison:]}', agg_freq='W')
+ax3.plot(siso_agg.index, siso_agg, '.', markersize=7, label=f'weekly agg ORPB {iso[-ison:]}')
 ax3.set_xlabel('Date')
 ax3.set_ylabel('Concentration [‰]')
 ax3.legend()
@@ -120,7 +126,7 @@ pisotopes_agg = isotopes.resample(agg_freq).mean()
 pisotopes_obs = isotopes.resample(agg_freq).last() # at weekly cadence
 pisotopes_agg[iso] = weighted_average(data, col=iso, agg_freq=agg_freq)
 fig, ax = plt.subplots()
-ax.scatter(pisotopes_obs[iso], pisotopes_agg[iso], label=f'$\Delta {iso[-2:]}$')
+ax.scatter(pisotopes_obs[iso], pisotopes_agg[iso], label=f'$\Delta {iso[-ison:]}$')
 ax.set_xlabel(f'Observed {iso} at {agg_freq} cadence [‰]')
 ax.set_ylabel(f'{agg_freq} aggregation {iso}')
 ax.plot()
@@ -134,24 +140,24 @@ print('Correlation: ', pisotopes_obs[iso].corr(pisotopes_agg[iso]))
 
 
 # %%
-# ---------------upsample using GP minus seasonal trend----------------
+# ---------------upsample using GP minus trend----------------
 
 # First, define data with coarse resolution to new resolution with weighted average on the isotope data
-c_res = 'D'
+c_res = 'BME'
 precip = data['rainfall (mm/hr)'].resample(c_res).sum()
 precip.name = 'rainfall (mm/hr)'
 precip = precip.apply(lambda x: round(x/2.54e-3)*2.54e-3)
 c_iso = data[[iso, 'Sample Name']].asfreq(c_res) #just reindex no change to values
-c_iso['weekly_obs'] = ~c_iso['Sample Name'].duplicated(keep='last')
 df = pd.concat([precip, c_iso],axis=1).loc[c_iso.index]
-df.ffill(inplace=True)
+df['weekly_obs'] = ~df.loc[df['rainfall (mm/hr)']>0, 'Sample Name'].duplicated(keep='last') # make sure weekly values are only for when rain was actually observed (1066 obs values vs only 235 when observed without rain restriction)
+df['weekly_obs'] = df['weekly_obs'].fillna(False) #set non-masked values to False i.e. where no rain observedc
+df.loc[df['weekly_obs']==False, iso] = np.nan # set non-weekly observed isotope values to nan so they don't influence GP fit
+df.ffill(inplace=True) # does the previous step do anything if we just ffill? maybe not, we still use the weekly_obs mask for GP prediction
 df['cumP'] = df['rainfall (mm/hr)'].cumsum()
 df['cumP'] = df['cumP'].apply(lambda x: round(x/2.54e-3)*2.54e-3)
 
 # define aggregation resolution
 agg_res = c_res
-#Use Method II: sinusoidal trend
-from scipy.optimize import curve_fit
 
 P_n = df.resample(agg_res).sum()['rainfall (mm/hr)']
 iso_n = df.resample(agg_res).apply(weighted_average, col=iso, agg_freq=agg_res)
@@ -160,6 +166,42 @@ resampled.columns = ['rainfall (mm/hr)', iso]
 resampled.ffill(inplace=True)
 resampled.bfill(inplace=True)
 t_agg = resampled.index.dayofyear
+
+#----CHOOSE METHOD FOR TREND REMOVAL: Method I: isoMAP based trend, Method II: sinusoidal trend
+#%%
+#Use Method I: isoMAP based trend
+isomap = pd.read_csv('isomap.csv')
+isomap = isomap[['H2_PB', 'O18_PB']]
+isomap.columns = ['2H', '18O']
+
+st, et = resampled.index[0], resampled.index[-1]
+delta_year = et.year - st.year + 1
+st_month, et_month = st.month, et.month
+
+# label isomap index by creating fake month
+mm = pd.DataFrame(
+    {"2H": np.tile(isomap['2H'].values, delta_year)[st_month-1:et_month-12],
+     "18O": np.tile(isomap['18O'].values, delta_year)[st_month-1:et_month-12]
+     }
+)
+mm.index = pd.to_datetime(pd.date_range(st, et + pd.DateOffset(days=29), freq='ME').strftime("%Y-%m-%d %H:00:00"))
+
+# create compatible index for monthly mean for calculation
+temp = pd.concat([resampled[iso], mm],axis=1)
+temp.columns = [iso, '2H_mm', '18O_mm']
+temp.bfill(inplace=True)
+temp.dropna(inplace=True)
+temp = temp.loc[resampled[iso].index]
+
+trend = temp[['2H_mm', '18O_mm']]
+trend.columns = ['2H', '18O']
+
+# define iso_fit trend to subtract from iso
+iso_fit = temp[f'{iso[-ison:]}_mm']
+
+#%%
+#Use Method II: sinusoidal trend
+from scipy.optimize import curve_fit
 
 # this makes a continuous day counter across multiple years
 def seasonal_sine(t, A, phi, b):
@@ -219,14 +261,30 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C, Matern
 
 df_gp = pd.concat([df['rainfall (mm/hr)'],df['cumP'], resampled[f'{iso} deseasoned'], df['weekly_obs']], axis=1)
+df_gp['weekly_obs'] = df_gp['weekly_obs'].fillna(False).astype(bool)
 precip_min, precip_max = df_gp.loc[df_gp['rainfall (mm/hr)'] != 0, 'rainfall (mm/hr)'].min(), df_gp['cumP'].max() #st and et of cumP
 df_gp[f'cum mass {iso} deseasoned'] = (df_gp[f'{iso} deseasoned']*df_gp['rainfall (mm/hr)']).cumsum()
 continuous_precip = pd.DataFrame(np.arange(0.0, precip_max+precip_min, precip_min), columns=['precip_continuous']) # creates an integral cumP with equal intervals for better GP prediction
-df_gp = df_gp.merge(continuous_precip, how='right', left_on='cumP', right_on='precip_continuous')
-df_gp[['cumP', f'cum mass {iso} deseasoned']] = df_gp[['cumP', f'cum mass {iso} deseasoned']].interpolate('spline', order=2)
-df_gp['weekly_obs'] = df_gp['weekly_obs'].fillna(False)
-X = df_gp['precip_continuous'][df_gp['weekly_obs']].values.reshape(-1,1) #convert to 2D array
-y = df_gp[f'cum mass {iso} deseasoned'][df_gp['weekly_obs']].values
+# df_gp = df_gp.merge(continuous_precip, how='right', left_on='cumP', right_on='precip_continuous')
+# df_gp[['cumP', f'cum mass {iso} deseasoned']] = df_gp[['cumP', f'cum mass {iso} deseasoned']].interpolate('spline', order=2)
+# X = df_gp['precip_continuous'][df_gp['weekly_obs']].values.reshape(-1,1) #convert to 2D array
+
+#---------- if merge cuts out all obs_weekly rows:
+# 1. FORCE continuous_precip to be a 1D numpy array
+continuous_precip = np.asarray(continuous_precip).astype(float).ravel()
+
+# 2. FORCE observation cumP to be a 1D numpy array
+mask = np.asarray(df_gp['weekly_obs']).astype(bool)
+cumP_obs = np.asarray(df_gp.loc[mask, 'cumP']).astype(float).ravel()
+
+# 3. Map observations to grid
+idx = np.searchsorted(continuous_precip, cumP_obs)
+idx = np.clip(idx, 0, continuous_precip.size - 1)
+
+# 4. Build X and y (both numpy arrays)
+X = continuous_precip.take(idx).reshape(-1, 1)
+y = np.asarray(df_gp.loc[mask, f'cum mass {iso} deseasoned']).astype(float).ravel()
+
 
 # Kernel = constant * RBF + noise
 kernel = C(1.0, (1e-2, 1e2)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2)) \
@@ -238,15 +296,50 @@ gp = GaussianProcessRegressor(kernel=Matern(), alpha=0.0000001, n_restarts_optim
 gp.fit(X, y)
 
 # Predict on test points
-Xtest = df_gp['precip_continuous'].values.reshape(-1, 1)
+# Xtest = df_gp['precip_continuous'].values.reshape(-1, 1)
+Xtest = continuous_precip.reshape(-1,1)
 y_mean, y_std = gp.predict(Xtest, return_std=True)
 
+
+# map predictions back to df.index -- this method rounds cumP and trys to merge which can shift predictions and mismatch upper/lower bounds
+# time_map = np.round(df['cumP']/precip_min) * precip_min
+# df_rev = pd.DataFrame(
+#     {
+#         "mean": np.round(y_mean, 5),
+#         "upper": np.round(y_mean+1.96*y_std, 5),
+#         "lower": np.round(y_mean-1.96*y_std, 5),
+#         "precip": Xtest.flatten(),
+#     }
+# ).drop_duplicates()
+# df_rev = df_rev.merge(pd.DataFrame(time_map), left_on='precip', right_on='cumP', how='right')
+# df_rev.index = df.index
+
+
+# map prediction back to df.index without rounding or merging errors
+cumP = df['cumP'].to_numpy()
+
+idx = np.searchsorted(continuous_precip, cumP) # value mapping
+idx = np.clip(idx, 1, len(continuous_precip) - 1)
+# map each time to nearest grid index
+left = continuous_precip[idx - 1]
+right = continuous_precip[idx]
+idx -= (cumP - left) < (right - cumP) # choose the nearest value in value space
+
+df_rev = pd.DataFrame(
+    {
+        "mean": y_mean[idx],
+        "upper": y_mean[idx] + 1.96 * y_std[idx],
+        "lower": y_mean[idx] - 1.96 * y_std[idx],
+        "precip": continuous_precip[idx],
+    },
+    index=df.index
+)
 
 #%%
 # ---------------plot GP predicted deseasoned mass fluxes----------------
 plt.figure(figsize=[10,5])
-plt.plot(df_gp.index, y_mean, '.-', label='GP predicted mass flux deseasoned')
-plt.fill_between(df_gp.index, y_mean - 2*y_std, y_mean + 2*y_std, 
+plt.plot(df_rev.index, df_rev['mean'], '.-', label='GP predicted mass flux deseasoned')
+plt.fill_between(df_rev.index, df_rev['lower'], df_rev['upper'], 
                  alpha=0.2, color="blue", label="Confidence interval")
 plt.plot(df_gp.index, df_gp[f'cum mass {iso} deseasoned'], marker='.', zorder=10, label=f'Observed mass flux deseasoned {iso}', alpha=0.2, color='orange')
 plt.xlabel('Date')
@@ -257,36 +350,25 @@ plt.show()
 
 # %%
 # ---------------plot GP predicted isotope fluxes----------------
-# map predictions back to df.index
-time_map = np.round(df['cumP']/precip_min) * precip_min
-df_rev = pd.DataFrame(
-    {
-        "mean": np.round(y_mean, 5),
-        "upper": np.round(y_mean+1.96*y_std, 5),
-        "lower": np.round(y_mean-1.96*y_std, 5),
-        "precip": Xtest.flatten(),
-    }
-).drop_duplicates()
-df_rev = df_rev.merge(pd.DataFrame(time_map), left_on='precip', right_on='cumP', how='right')
-df_rev.index = df.index
-df_rev['rainfall (mm/hr)'] = df_rev['precip'].diff()
-df_rev['rainfall (mm/hr)'][0] = 0.0
+
+df_rev[f'rainfall (mm/{agg_res})'] = df_rev['precip'].diff()
+df_rev.loc[df_rev.index[0], f'rainfall (mm/{agg_res})'] = 0.0
 df_rev['iso_fit'] = iso_fit
-df_rev['mean_c'] = df_rev['mean'] + (df_rev['iso_fit']*df_rev['rainfall (mm/hr)']).cumsum()
-df_rev['mean_c'] = df_rev['mean_c'].diff()/df_rev['rainfall (mm/hr)']
-df_rev.loc[df_rev['rainfall (mm/hr)']==0, 'mean_c'] = np.nan
-df_rev['upper_c'] = df_rev['upper'] + (df_rev['iso_fit']*df_rev['rainfall (mm/hr)']).cumsum()
-df_rev['upper_c'] = df_rev['upper_c'].diff()/df_rev['rainfall (mm/hr)']
-df_rev.loc[df_rev['rainfall (mm/hr)']==0, 'upper_c'] = np.nan
-df_rev['lower_c'] = df_rev['lower'] + (df_rev['iso_fit']*df_rev['rainfall (mm/hr)']).cumsum()
-df_rev['lower_c'] = df_rev['lower_c'].diff()/df_rev['rainfall (mm/hr)']
-df_rev.loc[df_rev['rainfall (mm/hr)']==0, 'lower_c'] = np.nan
+df_rev['mean_c'] = df_rev['mean'] + (df_rev['iso_fit']*df_rev[f'rainfall (mm/{agg_res})']).cumsum()
+df_rev['mean_c'] = df_rev['mean_c'].diff()/(df_rev[f'rainfall (mm/{agg_res})']+1e-6)
+df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']==0, 'mean_c'] = np.nan
+df_rev['upper_c'] = df_rev['upper'] + (df_rev['iso_fit']*df_rev[f'rainfall (mm/{agg_res})']).cumsum()
+df_rev['upper_c'] = df_rev['upper_c'].diff()/(df_rev[f'rainfall (mm/{agg_res})']+1e-6)
+df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']==0, 'upper_c'] = np.nan
+df_rev['lower_c'] = df_rev['lower'] + (df_rev['iso_fit']*df_rev[f'rainfall (mm/{agg_res})']).cumsum()
+df_rev['lower_c'] = df_rev['lower_c'].diff()/(df_rev[f'rainfall (mm/{agg_res})']+1e-6)
+df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']==0, 'lower_c'] = np.nan
 
 plt.figure(figsize=[15,5])
-plt.scatter(df_rev.index, df_rev['mean_c'], label=f'GP predicted {iso} {agg_res}', marker='.', alpha=0.3, zorder=10)
-plt.fill_between(df_rev.index, df_rev['lower_c'], df_rev['upper_c'], 
+plt.scatter(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'mean_c'], color='darkblue', s=10**2, label=f'GP predicted {iso} {agg_res}', marker='.', alpha=0.3, zorder=10)
+plt.fill_between(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'lower_c'], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'upper_c'], 
                  alpha=0.1, color="purple", label="Confidence interval")
-plt.scatter(df.index[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0)], df.loc[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0), iso], color='orange', marker='.', s=10**2, label=f'Observed {iso}')
+plt.scatter(df.index[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0)], df.loc[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0), iso], color='red', marker='.', s=10**2, label=f'Observed {iso}') #rainfall mask technically isn't needed since weekly_obs only takes rain days
 plt.xlabel('Date')
 plt.ylabel(f'{iso} concentration [‰]')
 plt.title(f'{iso}: GP predicted isotope concentration')
@@ -298,32 +380,25 @@ plt.show()
 
 #%% #fix this later***
 #-------------------Create resampled data with GP predicted isotope values----------------
-# assign gp predicted isotope values to resampled dataframe
 
-P_n = data.resample(agg_res).sum()['rainfall (mm/hr)']
 S_n = data.resample(agg_res).sum()['snowmelt (mm/hr)']
 D_n = data.resample(agg_res).sum()['discharge (mm/hr)']
 ET_n = data.resample(agg_res).sum()['ET (mm/hr)']
 ORPB18O_n = data.resample(agg_res)['ORPB 18O'].mean()
-resampled = pd.concat([P_n, S_n, D_n, ET_n, ORPB18O_n], axis=1)
-resampled.columns = [f'rainfall (mm/{agg_res})', f'snowmelt (mm/{agg_res})', f'discharge (mm/{agg_res})', f'ET (mm/{agg_res})', 'ORPB 18O']
-resampled.ffill(inplace=True)
-resampled.bfill(inplace=True)
-resampled[f'{iso}'] = y_mean_iso
-resampled[f'GP upper {iso}'] = y_upper
-resampled[f'GP lower {iso}'] = y_lower
+df_rev[[f'snowmelt (mm/{agg_res})', f'discharge (mm/{agg_res})', f'ET (mm/{agg_res})', 'ORPB 18O', 'ORPB 2H']] = data.resample(agg_res).agg({'snowmelt (mm/hr)': 'sum', 'discharge (mm/hr)': 'sum', 'ET (mm/hr)': 'sum', 'ORPB 18O': 'mean', 'ORPB 2H': 'mean'})
+
 
 # %%
 # save to csv files
 
-resolution = 'monthly' #bimonthly, weekly, daily, monthly #EDIT HERE depending on agg_res
+resolution = 'bimonthly' #bimonthly, weekly, daily, monthly #EDIT HERE depending on agg_res
 
 resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
 import os
 if not os.path.exists(resolution_dataset_root):
     os.makedirs(resolution_dataset_root)
 
-resampled.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_{resolution}.csv")
+df_rev.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{iso}_{resolution}.csv")
 
 
 # %%
