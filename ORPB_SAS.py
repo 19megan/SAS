@@ -62,6 +62,7 @@ plt.show()
 
 
 #%%
+data_df = data_df.loc[pd.Timestamp('2014-01-01'): pd.Timestamp('2018-09-21')] # 80% training data (data_df.iloc[int(len(data_df)*0.8)])
 # data_df = data_df.loc[pd.Timestamp('2014-08-01'): pd.Timestamp('2014-08-31')] #subset to Putnam's data range 2014-08-01 - 2016-08-31
 issample = np.logical_not(np.isnan(data_df['ORPB 18O']))
 #--------influx----------
@@ -74,21 +75,21 @@ data_df['bf1_weight'] = data_df['baseflow 1 (mm/hr)'] / data_df['discharge (mm/h
 data_df['qf_weight'] = data_df['quickflow (mm/hr)'] / data_df['discharge (mm/hr)']
 
 # Find data where quickflow is small - from baseflow separation code in GenerateCleanData_v2.ipyb
-data_df["rain+melt (mm/hr)"] = data_df["rainfall (mm/hr)"] + data_df["snowmelt (mm/hr)"]
-data_df["inputs in last 2d?"] = data_df["rain+melt (mm/hr)"].rolling('2d').sum() > 0
-data_df["inputs in next 3 hr?"] = data_df["rain+melt (mm/hr)"].rolling('3h').sum().shift(-3) > 0
-data_df['discharge censored (mm/hr)'] = data_df['discharge (mm/hr)']
-data_df.loc[data_df["inputs in last 2d?"] | data_df["inputs in next 3 hr?"], 'discharge censored (mm/hr)'] = np.NaN
-isbaseflow = data_df.loc[(data_df['discharge censored (mm/hr)'].notna()) & issample].index
-# or try finding based on quickflow < threshold
-plt.hist(data_df['quickflow (mm/hr)'], bins=2500)
-plt.xlim([0,0.04])
-plt.ylabel('frequency')
-plt.xlabel('quickflow (mm/hr)')
-print(len(data_df.loc[data_df['quickflow (mm/hr)']<0.001, 'quickflow (mm/hr)']), 'meet criteria out of ', len(data_df['quickflow (mm/hr)']))
-isbaseflow = data_df.loc[(data_df['quickflow (mm/hr)']<0.001) & issample].index
-isquickflow = data_df.loc[(data_df['quickflow (mm/hr)']>=0.001) & issample].index
-print(data_df.columns)
+# data_df["rain+melt (mm/hr)"] = data_df["rainfall (mm/hr)"] + data_df["snowmelt (mm/hr)"]
+# data_df["inputs in last 2d?"] = data_df["rain+melt (mm/hr)"].rolling('2d').sum() > 0
+# data_df["inputs in next 3 hr?"] = data_df["rain+melt (mm/hr)"].rolling('3h').sum().shift(-3) > 0
+# data_df['discharge censored (mm/hr)'] = data_df['discharge (mm/hr)']
+# data_df.loc[data_df["inputs in last 2d?"] | data_df["inputs in next 3 hr?"], 'discharge censored (mm/hr)'] = np.NaN
+# isbaseflow = data_df.loc[(data_df['discharge censored (mm/hr)'].notna()) & issample].index
+# # or try finding based on quickflow < threshold
+# plt.hist(data_df['quickflow (mm/hr)'], bins=2500)
+# plt.xlim([0,0.04])
+# plt.ylabel('frequency')
+# plt.xlabel('quickflow (mm/hr)')
+# print(len(data_df.loc[data_df['quickflow (mm/hr)']<0.001, 'quickflow (mm/hr)']), 'meet criteria out of ', len(data_df['quickflow (mm/hr)']))
+# isbaseflow = data_df.loc[(data_df['quickflow (mm/hr)']<0.001) & issample].index
+# isquickflow = data_df.loc[(data_df['quickflow (mm/hr)']>=0.001) & issample].index
+# print(data_df.columns)
 
 #%% # ------------------Check for nans-------------------
 # ------------------Check for nans-------------------
@@ -112,7 +113,7 @@ mean = data_df['precip 18O'].mean()
 df= data_df.copy() #make a copy of the data_df
 # df.loc[df['precip 18O'].isna()==True, 'precip 18O']=mean
 # Instead of filling with mean, use forward/backward fill or interpolation
-df['precip 18O'] = df['precip 18O'].fillna(method='ffill').fillna(method='bfill')
+df['precip 18O'] = df['precip 18O'].ffill().bfill()
 
 # assert positive ET values
 # df.loc[df['ET (mm/hr)']<0, 'ET (mm/hr)']=0
@@ -207,7 +208,7 @@ def make_gamma_split_model_from(params): # split quickflow and baseflow with dif
                                 'scale': et_scale}}}
                 }
     solute_parameters = {'precip 18O': {'C_old': c18O_old, 'observations': 'ORPB 18O'}}
-    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=True, verbose=True, n_substeps=1)
+    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=False, verbose=True, n_substeps=1)
 # gamma distribution for optimizing S_0 has different assumptions of the affect of storage with the shape of the SAS function
 # if using 'scipy.stats', then replace 'func' with 'scipy.stats' and function does not need ""
 def make_kumar_model_from(params): # for kumaraswamy distribution
@@ -387,6 +388,8 @@ params = basinhopping(minimize_me, params_init, niter=25, T=0.01, stepsize=0.1)
 #%%
 # ------------------Try Monte Carlo sampling----------------------
 from tqdm import tqdm
+from scores.continuous import nse
+import xarray as xr
 normalized_storage = df['storage (mm)']-df['storage (mm)'].mean()
 R=normalized_storage.max()-normalized_storage.min()
 # param bounds
@@ -398,7 +401,7 @@ R=normalized_storage.max()-normalized_storage.min()
 #     "et_scale": (5, 100)
 # }
 bounds = {# for gamma split model
-    "c18O_old": (-7.8, -7.5),
+    "c18O_old": (-16.9, -0.445),
     "a_qf": (0.1, 1.0),      # quickflow: young water, shorter travel time
     "t_qf": (0.1, 1.0),      # quickflow: young water, shorter travel time
     "a_bf": (1.0, 5.0),      # baseflow: old water, longer travel time
@@ -418,44 +421,59 @@ def evaluate_model(params):
 
         obs = model.data_df['ORPB 18O'][issample].to_numpy()
         pred = model.data_df['precip 18O --> discharge (mm/hr)'][issample].to_numpy()
+        del model #free up memory
         if np.any(np.isnan(pred)) or np.any(np.isinf(pred)):
+            print('nan results in pred or obs')
             return np.nan
         RMSE = np.sqrt(np.mean((pred-obs)**2))
-        return RMSE
+        obs_xr = xr.DataArray(obs)
+        pred_xr = xr.DataArray(pred)
+        NSE = nse(pred_xr, obs_xr)
+        return RMSE, NSE.item()
     except Exception as e: # catches unstable parameter combinations
         return np.nan
 
-N = 100 #samples
+N = 1000 #samples
 results = []
 for _ in tqdm(range(N)):
     params = sample_params(bounds)
-    RMSE = evaluate_model(params)
-    if not np.isnan(RMSE):
-        results.append((params + [RMSE]))
+    result = evaluate_model(params)
+    if result is not np.nan and not np.isnan(result[0]):
+        RMSE, NSE = result
+        results.append((params + [RMSE, NSE]))
 
-cols = param_names + ['RMSE']
+cols = param_names + ['RMSE','NSE']
 results_df = pd.DataFrame(results, columns=cols)
 print(results_df.describe())
 
-threshold = results_df['RMSE'].quantile(0.05) # top 5% of samples
-best = results_df[results_df['RMSE'] <= threshold]
-print("RMSE threshold: ", threshold)
-print(best.describe())
-
 
 #%%
-#extract results and visualize
-p = best.loc[best['RMSE']==best['RMSE'].min()]
-p = p.to_numpy()
-p = np.delete(p, -1) # take off RMSE column for params
-print(p)
-model = make_gamma_split_model_from(p) #***edit which distribution***
-model.run()
+# load results_df from Rockfish
+results_df = pd.read_csv('results_df.csv')
+results_df.drop(columns='Unnamed: 0', inplace=True) # drop index column if it exists
+
+threshold = results_df['RMSE'].quantile(0.05) # top 5% of samples
+thresholdnse = results_df['NSE'].quantile(0.95)
+best = results_df[(results_df['RMSE'] <= threshold) & (results_df['NSE']>=thresholdnse)]
+print("RMSE threshold: ", threshold)
+print(best.describe())
 
 best.hist(bins=20, figsize=(12, 8))
 plt.tight_layout()
 plt.legend()
 plt.show()
+#%%
+#extract results and visualize
+# p = best.loc[best['RMSE']==best['RMSE'].min()]
+p = best.loc[best['NSE']==best['NSE'].max()].iloc[0] # take first row if multiple have same max NSE
+p = p.to_numpy()
+p = np.delete(p, -1) # take off RMSE column for params
+p = np.delete(p, -1) # take of NSE column
+print(p)
+model = make_gamma_split_model_from(p) #***edit which distribution***
+model.run()
+
+
 #%%
 # ------------------Build the model --------------------
 # Now build a model with parameters
@@ -514,10 +532,30 @@ plt.title('Isotope outflow at ORPB')
 # ax2.legend()
 # ax2.set_title('Isotope outflow at ORPB')
 
+#%%
+# Plot TTD
+pq = model.get_pQ('discharge (mm/hr)')
+cumTTD = np.cumsum(pq, axis=0) * model.options['dt']
+arS = model.get_ST()[:,1]
+ars = model.get_sT()[:,1]
+time = model.options['dt']*np.arange(model.options['max_age'])
+fig = plt.figure(figsize=[11,4])
+ax1 = plt.subplot2grid((1,2), (0,0))
+ax1.plot(arS, cumTTD)
+ax1.set_ylim([0, 1])
+ax1.set_xlim(xmin=0)
+ax1.plot(ax1.get_xlim(), [1, 1], color='0.1', lw=0.8, ls=':')
+ax1.plot(ax1.get_xlim(), [0, 0], color='0.1', lw=0.8, ls=':')
+ax1.set_xlabel('$S_T$')
+ax1.set_ylabel('$\Omega(S_T)$')
+ax1.set_title('Cumulative TTD')
 
-
-
-
+ax2 = plt.subplot2grid((1,2), (0,1))
+ax2.plot(arS, pq)
+ax2.set_xlabel('$S_T$')
+ax2.set_ylabel('$\omega(S_T)$')
+ax2.set_title('TTD')
+plt.tight_layout()
 
 
 
