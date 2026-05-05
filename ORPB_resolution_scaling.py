@@ -65,7 +65,7 @@ data['is_weekly'] = issample
 
 #%%-----------------precip isotopes-------------------------------------------------
 isotopes = data[['precip 2H', 'precip 18O', 'precip 17O']] # we want to scale the input isotopes
-iso = 'precip 2H' #'precip 18O' #'precip 2H'
+iso = 'precip 18O' #'precip 18O' #'precip 2H'
 if iso == 'precip 2H': #number of digits needed for isotope type
     ison = 2
 elif iso == 'precip 18O':
@@ -143,7 +143,7 @@ print('Correlation: ', pisotopes_obs[iso].corr(pisotopes_agg[iso]))
 # ---------------upsample using GP minus trend----------------
 
 # First, define data with coarse resolution to new resolution with weighted average on the isotope data
-c_res = 'BME'
+c_res = 'ME' #bimonthly (BME), weekly (W), daily (D), monthly (ME) #EDIT HERE depending on agg_res
 precip = data['rainfall (mm/hr)'].resample(c_res).sum()
 precip.name = 'rainfall (mm/hr)'
 precip = precip.apply(lambda x: round(x/2.54e-3)*2.54e-3)
@@ -298,7 +298,33 @@ gp.fit(X, y)
 # Predict on test points
 # Xtest = df_gp['precip_continuous'].values.reshape(-1, 1)
 Xtest = continuous_precip.reshape(-1,1)
-y_mean, y_std = gp.predict(Xtest, return_std=True)
+# y_mean, y_std = gp.predict(Xtest, return_std=True)
+
+# # to save memory can predict in batches if Xtest is too large
+# def predict_in_batches(gp, X_test, batch_size=500):
+#     means, stds = [], []
+#     for i in range(0, len(X_test), batch_size):
+#         batch = X_test[i:i+batch_size]
+#         m, s = gp.predict(batch, return_std=True)
+#         means.append(m)
+#         stds.append(s)
+#     return np.concatenate(means), np.concatenate(stds)
+
+# y_mean, y_std = predict_in_batches(gp, Xtest, batch_size=500)
+
+# or can subsample training data more aggressively since input is 1D and smooth
+# predict on fine grid, then interpolate
+# Predict on a coarse grid
+grid = np.linspace(Xtest.min(), Xtest.max(), 2000).reshape(-1, 1)
+y_mean_grid, y_std_grid = gp.predict(grid, return_std=True)
+
+# Interpolate back to original resolution
+from scipy.interpolate import interp1d
+mean_fn = interp1d(grid.ravel(), y_mean_grid, kind='cubic')
+std_fn  = interp1d(grid.ravel(), y_std_grid,  kind='cubic')
+
+y_mean = mean_fn(Xtest.ravel())
+y_std  = std_fn(Xtest.ravel())
 
 
 # map predictions back to df.index -- this method rounds cumP and trys to merge which can shift predictions and mismatch upper/lower bounds
@@ -385,13 +411,13 @@ S_n = data.resample(agg_res).sum()['snowmelt (mm/hr)']
 D_n = data.resample(agg_res).sum()['discharge (mm/hr)']
 ET_n = data.resample(agg_res).sum()['ET (mm/hr)']
 ORPB18O_n = data.resample(agg_res)['ORPB 18O'].mean()
-df_rev[[f'snowmelt (mm/{agg_res})', f'discharge (mm/{agg_res})', f'ET (mm/{agg_res})', 'ORPB 18O', 'ORPB 2H']] = data.resample(agg_res).agg({'snowmelt (mm/hr)': 'sum', 'discharge (mm/hr)': 'sum', 'ET (mm/hr)': 'sum', 'ORPB 18O': 'mean', 'ORPB 2H': 'mean'})
+df_rev[[f'snowmelt (mm/{agg_res})', f'snowfall SWE (mm/{agg_res})', f'discharge (mm/{agg_res})', 'storage (mm)', f'ET (mm/{agg_res})', f'baseflow 1 (mm/{agg_res})', 'ORPB 18O', 'ORPB 2H', 'is_weekly']] = data.resample(agg_res).agg({'snowmelt (mm/hr)': 'sum', 'snowfall SWE (mm/hr)': 'sum', 'discharge (mm/hr)': 'sum',  'storage (mm)': 'mean', 'ET (mm/hr)': 'sum', 'baseflow 1 (mm/hr)': 'sum', 'ORPB 18O': 'mean', 'ORPB 2H': 'mean', 'is_weekly': 'any'})
 
 
 # %%
 # save to csv files
 
-resolution = 'bimonthly' #bimonthly, weekly, daily, monthly #EDIT HERE depending on agg_res
+resolution = 'monthly' #bimonthly, weekly, daily, monthly #EDIT HERE depending on agg_res
 
 resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
 import os
@@ -399,6 +425,46 @@ if not os.path.exists(resolution_dataset_root):
     os.makedirs(resolution_dataset_root)
 
 df_rev.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{iso}_{resolution}.csv")
+# df_rev.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_sinusoid_{iso}_{resolution}.csv")
+
+# %%
 
 
+
+# additonal visualization
+resolution = 'daily'
+resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
+df_rev = pd.read_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{iso}_{resolution}.csv", index_col=0, parse_dates=[0])
+
+plt.figure(figsize=[10,5])
+plt.scatter(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'mean_c'], color='darkblue', s=10**2, label=f'GP predicted {iso} {agg_res}', marker='.', alpha=0.3, zorder=10)
+plt.fill_between(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'lower_c'], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'upper_c'], 
+                 alpha=0.1, color="purple", label="Confidence interval")
+plt.scatter(df.index[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0)], df.loc[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0), iso], color='red', marker='.', s=10**2, label=f'Observed {iso}') #rainfall mask technically isn't needed since weekly_obs only takes rain days
+plt.xlabel('Date')
+plt.ylabel(f'{iso} concentration [‰]')
+plt.title(f'{iso}: GP predicted isotope concentration')
+plt.xlim([pd.Timestamp('2018-01-01'), pd.Timestamp('2018-03-01')])
+plt.legend()
+plt.show()
+#%%
+#precip and discharge plot for reference
+fig,ax = plt.subplots(nrows=1,ncols=1,figsize=[12,4])
+ax.plot(data.index, data['discharge (mm/hr)'], color='blue', label='discharge (mm/hr)')
+ax.set_xlabel('Date')
+ax.set_ylabel('Discharge (mm/hr)', color='blue')
+ax.tick_params(axis='y', labelcolor='blue')
+ax1 = ax.twinx()
+ax1.bar(data.index, data['rainfall (mm/hr)'], color='gray', alpha=0.6, width=0.01, label='rainfall (mm/hr)')
+ax1.bar(data.index, data['snowfall SWE (mm/hr)'], color='black', alpha=0.6, width=0.01, label='snowfall SWE (mm)')
+ax1.set_ylabel('(mm/hr)', color='gray')
+ax1.tick_params(axis='y', labelcolor='gray')
+ax1.set_ylim([0,0.75])#max(max(data_df['rainfall (mm/hr)']), max(data_df['snowfall SWE (mm/hr)']))*1.1])
+ax1.invert_yaxis()
+ax.set_title('ORPB Discharge and Rainfall')
+ax.legend()
+ax1.legend()
+ax.set_xlim([pd.Timestamp('2014-08-01'), pd.Timestamp('2015-08-01')])
+ax1.set_xlim([pd.Timestamp('2014-08-01'), pd.Timestamp('2015-08-01')])
+plt.tight_layout()
 # %%
