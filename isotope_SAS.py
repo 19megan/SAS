@@ -40,7 +40,7 @@ data_df.to_csv('data.csv')
 
 #%%
 #Now we can run messas.py
-model=Model(data_df='data.csv',config='config.json')
+model=Model(data_df='data.csv',config='config.json') #in config, record_state:True keeps a record of all state variables at each time step, which is useful for plotting and analysis
 model.run()
 model.data_df.to_csv('results.csv')
 #%%
