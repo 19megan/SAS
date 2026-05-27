@@ -11,7 +11,18 @@ import matplotlib.pyplot as plt
 from mesas.sas.model import Model
 from permetrics.regression import RegressionMetric
 
-data_df = pd.read_csv('ORPB_isotope_data.csv', index_col=0, parse_dates=[0])
+# data_df = pd.read_csv('ORPB_isotope_data.csv', index_col=0, parse_dates=[0])
+
+#or use resolution data
+res = 'D'
+resolution = 'daily'
+data_df = pd.read_csv(f"/Users/simon/Desktop/ORPB_resolution_datasets/ORPB_isotope_data_isoMAP_precip 18O_{resolution}.csv", index_col=0, parse_dates=[0])
+data_df['precip 18O'] = data_df['mean_c']
+data_df['discharge (mm/hr)'] = data_df[f'discharge (mm/{res})'] # for convenience now
+data_df['baseflow 1 (mm/hr)'] = data_df[f'baseflow 1 (mm/{res})']
+data_df['snowmelt (mm/hr)'] = data_df[f'snowmelt (mm/{res})']
+data_df['rainfall (mm/hr)'] = data_df[f'rainfall (mm/{res})']
+data_df['ET (mm/hr)'] = data_df[f'ET (mm/{res})']
 
 #%% plot timeseries of full data (Figure 1 in my dissertation proposal)
 fig,(ax1,ax2, ax3)=plt.subplots(nrows=3,ncols=1,figsize=[10,9])
@@ -62,8 +73,8 @@ plt.show()
 
 
 #%%
-data_df = data_df.loc[pd.Timestamp('2014-01-01'): pd.Timestamp('2018-09-21')] # 80% training data (data_df.iloc[int(len(data_df)*0.8)])
-# data_df = data_df.loc[pd.Timestamp('2014-08-01'): pd.Timestamp('2014-08-31')] #subset to Putnam's data range 2014-08-01 - 2016-08-31
+# data_df = data_df.loc[pd.Timestamp('2014-01-01'): pd.Timestamp('2018-09-21')] # 80% training data (data_df.iloc[int(len(data_df)*0.8)])
+# data_df = data_df.loc[pd.Timestamp('2014-01-01'): pd.Timestamp('2014-12-31')] #subset to Putnam's data range 2014-08-01 - 2016-08-31
 issample = np.logical_not(np.isnan(data_df['ORPB 18O']))
 #--------influx----------
 # df['influx (mm/hr)'] = df['rainfall (mm/hr)']
@@ -208,7 +219,7 @@ def make_gamma_split_model_from(params): # split quickflow and baseflow with dif
                                 'scale': et_scale}}}
                 }
     solute_parameters = {'precip 18O': {'C_old': c18O_old, 'observations': 'ORPB 18O'}}
-    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=False, verbose=True, n_substeps=1)
+    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=True, verbose=True, n_substeps=1)
 # gamma distribution for optimizing S_0 has different assumptions of the affect of storage with the shape of the SAS function
 # if using 'scipy.stats', then replace 'func' with 'scipy.stats' and function does not need ""
 def make_kumar_model_from(params): # for kumaraswamy distribution
@@ -230,33 +241,45 @@ def make_kumar_model_from(params): # for kumaraswamy distribution
     return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)')
 
 def make_Putnam_model_from(params): # from Putnam Chapter 3
-    a_bf, t_bf, LnS_Tet = params
+    a_bf, lamda, S_c, S_Tet = params
     #Normalize parameters
-    S_Tet = np.exp(LnS_Tet)*1530.484 #ensures S_Tet is always positive
-    # c18O_old = c18O_old*(-7.6) #normalize to -7.6
-    t_bf = t_bf*1423.08 # normalize to corrected with >0 ET, storage calc of storage.max=storage.min * bf1_weight.mean
+    # S_Tet = np.exp(LnS_Tet)*1530.484 #ensures S_Tet is always positive
+    # # c18O_old = c18O_old*(-7.6) #normalize to -7.6
+    # t_bf = t_bf*1423.08 # normalize to corrected with >0 ET, storage calc of storage.max=storage.min * bf1_weight.mean
     # make new column that is a parameter * wetness and put into ST max for quickflow
     # df['wwetness'] = df['wetness']*q_max #normalize to wetness
-    sas_specs = {'quickflow (mm/hr)':
-                        {'ORPB qf':
-                            {"ST": [0, 0.254],
-                             "P": [0.0, 1.0]}
-                        }, #if >1 dict for 'quickflow (mm/hr)', then mesas looks for column named 'ORPB qf' and other dict key(s) -- >1 dict will allow for weighted SAS functions, these columns in df will be the weights [0,1]
-                 'baseflow 1 (mm/hr)':
-                        {'ORPB bf':
-                                {'func': 'gamma',
-                                 'args': { 'a': a_bf,
-                                       'scale': t_bf,
-                                         'loc': 0 }}
-                        },
-                 'ET (mm/hr)': 
-                        {'ET':
-                            {'ST': [0, S_Tet],
-                             'P': [0.0, 1.0]}
-                        }
-                }
-    solute_parameters = {'precip 18O': {'C_old': -7.6}}
-    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)')
+    df['S_scale'] = lamda*(df['storage (mm)']-S_c) #slope and intercept 
+    sas_specs = {
+        'discharge (mm/hr)':
+            {'qf_weight': # this column in df will be the weight for the quickflow SAS function, and 1 - this column will be the weight for the baseflow 1 SAS function:
+                {'func': 'kumaraswamy',
+                           'args':{
+                                'a': 1.0,
+                                'b': 1.0,
+                                'loc': 0.0,
+                                'scale': 0.24}
+                },
+            'bf1_weight':
+                {'func':'gamma',
+                'args': {
+                        'a': a_bf,
+                    'scale': 'S_scale', #t_bf,
+                      'loc': 0
+                    }}
+            }, 
+#if >1 dict for 'quickflow (mm/hr)', then mesas looks for column named 'ORPB qf' and other dict key(s) -- >1 dict will allow for weighted SAS functions, these columns in df will be the weights [0,1]
+        'ET (mm/hr)': 
+            {'ET':
+                {'func': 'kumaraswamy',
+                           'args':{
+                                'a': 1.0,
+                                'b': 1.0,
+                                'loc': 0.0,
+                                'scale': et_scale}}
+            }
+    }
+    solute_parameters = {'precip 18O': {'C_old': -7.6, 'observations': 'ORPB 18O'}}
+    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=True)
                   
 
 
@@ -294,7 +317,7 @@ def maximize_me(params):
 
 #--------storage----------
 # Now let's supply initial estimates of parameters #opt gamma rmse: 0.5374013865404, b-rmse: 0.53211672085
-# S_0 = 5701.46684 # latest g-opt: 5701.46684, b-opt: 6245.18546 (mm) initial storage, can be set to any value
+S_0 = 5701.46684 # latest g-opt: 5701.46684, b-opt: 6245.18546 (mm) initial storage, can be set to any value
 # Try keeping S_0 constant and optimizing other parameters
 
 # df['abs_storage (mm)'] = df['storage (mm)'] + S_0 # (mm)
@@ -303,7 +326,7 @@ def maximize_me(params):
 # df['wetness'] = (df['storage (mm)'] - S_min) / (S_max - S_min) # catchment wetness
 
 #--------ET storage----------
-# S_Tet = 0.02822 #0.58 # normalize to S_max-S_min = 1530.484 (mm)
+S_Tet = 48.8 #0.02822 #0.58 # normalize to S_max-S_min = 1530.484 (mm)
 # LnS_Tet = np.log(S_Tet) # optimize ln(S_Tet) to ensure S_Tet is always positive
 et_scale = 40.827 #43.4542481 # (mm) from pmcmc
 
@@ -312,17 +335,17 @@ c18O_old = -7.6 #-7.3898 #-7.790043373 #normalize to -7.6 for Putnam model #df['
 # 0.98*-7.6 = -7.44 for starting date 2014-08-01 (Putnam's subset)
 #--------distribution parameters--------
 a = 1.26 #1.26399 #1.249941962 # laetest g-opt: 0.8293324, b-opt: 0.733789
-# b = 0.9923319 #latest b-opt: 0.945078
-# a_bf = 1.26 #(df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2 # mean^2/std^2 = (df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2
-# t_bf = 1.48 #1.36-2.23 normalized to storage (df['baseflow 1 (mm/hr)'].std())**2/df['baseflow 1 (mm/hr)'].mean() #variance/mean, or should be mean storage that contains baseflow
+b = 0.9923319 #latest b-opt: 0.945078
+a_bf = 2.84 #1.26 #(df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2 # mean^2/std^2 = (df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2
+t_bf = 1100 #1.48 #1.36-2.23 normalized to storage (df['baseflow 1 (mm/hr)'].std())**2/df['baseflow 1 (mm/hr)'].mean() #variance/mean, or should be mean storage that contains baseflow
 # q_max = 1 #normalized to wetness
 # lamda = -109.184 #-115.0382 #-106.9838848
 # S_c = 51.5895 #49.9052 #50.67889314
 
 # calculate realistic scale and lamda
 # S_scale = controls mean travel time and how it responds to storage, lamda = senstivity of transit time to storage, S_c = storage threshold where travel time begins to change ensure positivity by making storage>S_c so S_c<=min(storage)
-S_c=df['storage (mm)'].min()-50 #min(df['storage (mm)'])-50 # this is solid, should be less than dynamic storage
-lamda=.5 #12.1017 # 10/(df['storage (mm)'].median()-S_c) #median of storage is s_ref
+S_c=-2008.44 #-953.4 #df['storage (mm)'].min()-50 #[-1745.29, -1404.9] # this is solid, should be less than dynamic storage
+lamda=1.22 #.5 #12.1017 # 10/(df['storage (mm)'].median()-S_c) #median of storage is s_ref
 #%%
 # sscale=lamda*(scale-sc)
 # plt.plot(scale,sscale) #increase monotonically
@@ -362,8 +385,11 @@ lamda=.5 #12.1017 # 10/(df['storage (mm)'].median()-S_c) #median of storage is s
 
 #%%
 #--------set params_init---------
-params_init = c18O_old, a, lamda, S_c, et_scale #***edit for distribution type***
-params=params_init
+# params_init = c18O_old, a, lamda, S_c, et_scale #***edit for distribution type***
+params = a_bf, lamda, S_c, S_Tet # for Putnam model
+# params = S_0, c18O_old #uniform model
+# params = S_0, c18O_old, a, b # for beta model
+# params=params_init
 
 #consider normalizing parameters to obtain better convergence of optimization
 # Beta notes: a<1, b=1 young water prefernce, a=1,b<1 old water preference, a=b=1 uniform selection
@@ -478,7 +504,7 @@ model.run()
 # ------------------Build the model --------------------
 # Now build a model with parameters
 from mesas.sas.model import Model
-model = make_gamma_model_from(params) #***edit which distribution***
+model = make_Putnam_model_from(params) #***edit which distribution***
 model.run()
 
 #%%------------------Save model to pickle-------------------
@@ -499,7 +525,7 @@ fig = plt.figure(figsize=[14,4])
 # pred = model.data_df['bf1_weight'][isbaseflow].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][isbaseflow].to_numpy())
 # plt.plot(isbaseflow, pred,'-', label='Predicted 18O baseflow')
 
-plt.plot(model.data_df.index[issample], model.data_df['ORPB 18O'][issample],'.-', color='grey', label='Observed 18O outflow')
+plt.plot(model.data_df.index[issample], model.data_df['ORPB 18O'][issample],'.', color='grey', label='Observed 18O outflow')
 
 # ----for quickflow/baseflow split
 # pred = (1-model.data_df['bf1_weight'][issample].to_numpy())*(model.data_df['precip 18O --> quickflow (mm/hr)'][issample].to_numpy()) + model.data_df['bf1_weight'][issample].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][issample].to_numpy())
@@ -508,7 +534,7 @@ plt.plot(model.data_df.index[issample], model.data_df['ORPB 18O'][issample],'.-'
 # plt.plot(model.data_df.index[issample], model.data_df['precip 18O --> baseflow 1 (mm/hr)'][issample], label='Predicted 18O baseflow 1')
 
 # ----for combined discharge
-plt.plot(model.data_df.index, model.data_df['precip 18O --> discharge (mm/hr)'], '.-', color='orange', alpha=0.3,label='Predicted 18O outflow')
+plt.plot(model.data_df.index, model.data_df['precip 18O --> discharge (mm/hr)'], '-', color='orange', alpha=0.3,label='Predicted 18O outflow')
 # plt.axvspan(pd.Timestamp('2014-10-01'), pd.Timestamp('2015-09-30'), color='lightgrey', alpha=0.5)
 # plt.axvspan(pd.Timestamp('2016-10-01'), pd.Timestamp('2017-09-30'), color='lightgrey', alpha=0.5)
 # plt.axvspan(pd.Timestamp('2018-10-01'), pd.Timestamp('2019-09-30'), color='lightgrey', alpha=0.5)
@@ -534,30 +560,67 @@ plt.title('Isotope outflow at ORPB')
 
 #%%
 # Plot TTD
+import matplotlib.cm as cm
+cmap = plt.get_cmap('viridis')
+colors = [cmap(i) for i in np.linspace(0,1,len(df))]
 pq = model.get_pQ('discharge (mm/hr)')
-cumTTD = np.cumsum(pq, axis=0) * model.options['dt']
-arS = model.get_ST()[:,1]
-ars = model.get_sT()[:,1]
-time = model.options['dt']*np.arange(model.options['max_age'])
-fig = plt.figure(figsize=[11,4])
-ax1 = plt.subplot2grid((1,2), (0,0))
-ax1.plot(arS, cumTTD)
-ax1.set_ylim([0, 1])
-ax1.set_xlim(xmin=0)
-ax1.plot(ax1.get_xlim(), [1, 1], color='0.1', lw=0.8, ls=':')
-ax1.plot(ax1.get_xlim(), [0, 0], color='0.1', lw=0.8, ls=':')
-ax1.set_xlabel('$S_T$')
-ax1.set_ylabel('$\Omega(S_T)$')
-ax1.set_title('Cumulative TTD')
+T = model.options['dt'] *np.arange(model.options['max_age'])
+PQ = np.cumsum(pq, axis=0) * model.options['dt']
 
-ax2 = plt.subplot2grid((1,2), (0,1))
-ax2.plot(arS, pq)
-ax2.set_xlabel('$S_T$')
-ax2.set_ylabel('$\omega(S_T)$')
-ax2.set_title('TTD')
+fig, ax = plt.subplots(nrows=1, ncols=2, figsize=[11,4])
+for i in range(0, len(df)):
+    ax[0].plot(T, PQ[:,i], color=colors[i])
+    ax[1].plot(T, pq[:,i], color=colors[i])
+
+ax[0].set_ylim([0, 1])
+ax[0].set_xlim(xmin=0)
+ax[0].axhline(1, color='0.1', lw=0.8, ls=':')
+ax[0].axhline(0, color='0.1', lw=0.8, ls=':')
+ax[0].set_xlabel('Age (days)')
+ax[0].set_ylabel('$P_Q$')
+ax[0].set_title('Cumulative TTD')
+ax[1].set_xlim([0,25])
+ax[1].set_xlabel('Age (days)')
+ax[1].set_ylabel('$p_Q$')
+ax[1].set_title('TTD')
+sm = cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0,
+vmax=len(df)-1))
+sm.set_array([])
+fig.colorbar(sm, ax=ax, label='Time Index', fraction=0.046, pad=0.04)
+
+
+
+
+
+# %%
+#Plot volume of water in storage with age less than 90
+ST = model.get_ST(agestep=90) #i.e. model.get_ST()[90,:]
+plt.figure(figsize=[10,4])
+plt.step(T+1, ST[1:], where='pre')
+plt.xlabel('Time (days)')
+plt.ylabel('Volume (mm)')
+plt.title('Volume of water in storage with age < 90 days')
+
+
+# %%
+#Plot FYW (<90 days)
+ST = model.get_ST()
+FYW = ST[90,:]/ST[-1,:]
+fig = plt.figure(figsize=[12,10])
+ax1 = plt.subplot2grid((7,1), (0,0), rowspan=2)
+ax1.step(df.index, df['influx (mm/hr)'])
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Recharge (mm/hr)')
+
+ax2 = plt.subplot2grid((7,1), (2,0), rowspan=3)
+ax2.step(T+1, FYW[1:], where='pre', color='black')
+ax2.set_xlabel('Time (days)')
+ax2.set_ylabel('Fraction of Young Water')
+ax2.set_title('Fraction of Young Water in storage with age < 90 days')
+
+ax3 = plt.subplot2grid((7,1), (5,0), rowspan=2)
+ax3.plot(df.index, df['discharge (mm/hr)'])
+ax3.set_xlabel('Date')
+ax3.set_ylabel('Discharge (mm/hr)')
 plt.tight_layout()
-
-
-
-
 # %%
