@@ -15,6 +15,7 @@ data = pd.read_csv('ORPB_isotope_data.csv', index_col=0, parse_dates=[0]) #len 5
 data = data.drop(data[data['Sample Name'].isna()].index)
 issample = ~data.loc[data['rainfall (mm/hr)']>0, 'Sample Name'].duplicated(keep='last')
 data['is_weekly'] = issample
+data['cumP'] = data['rainfall (mm/hr)'].cumsum()
 #%% ----------------stream isotopes-------------------------------------------------
 # note: if using stream isotopes, need to change the mass flux calculation to use discharge instead of precipitation
 # isotopes = data[['ORPB 2H', 'ORPB 18O', 'ORPB 17O']]
@@ -121,7 +122,7 @@ plt.show()
 
 #%%
 # ---------------down/upsample to bimonthly (BME), monthly (ME), daily (D), etc.----------------
-agg_freq = 'W'
+agg_freq = 'W' #hourly (h), daily (D), weekly (W), biweekly (2W), monthly (ME)
 pisotopes_agg = isotopes.resample(agg_freq).mean()
 pisotopes_obs = isotopes.resample(agg_freq).last() # at weekly cadence
 pisotopes_agg[iso] = weighted_average(data, col=iso, agg_freq=agg_freq)
@@ -143,7 +144,7 @@ print('Correlation: ', pisotopes_obs[iso].corr(pisotopes_agg[iso]))
 # ---------------upsample using GP minus trend----------------
 
 # First, define data with coarse resolution to new resolution with weighted average on the isotope data
-c_res = 'ME' #bimonthly (BME), weekly (W), daily (D), monthly (ME) #EDIT HERE depending on agg_res
+c_res = '2W' #hourly (h), daily (D), weekly (W), biweekly (2W), monthly (ME) #EDIT HERE depending on agg_res
 precip = data['rainfall (mm/hr)'].resample(c_res).sum()
 precip.name = 'rainfall (mm/hr)'
 precip = precip.apply(lambda x: round(x/2.54e-3)*2.54e-3)
@@ -157,7 +158,7 @@ df['cumP'] = df['rainfall (mm/hr)'].cumsum()
 df['cumP'] = df['cumP'].apply(lambda x: round(x/2.54e-3)*2.54e-3)
 
 # define aggregation resolution
-agg_res = c_res
+agg_res = 'h'
 
 P_n = df.resample(agg_res).sum()['rainfall (mm/hr)']
 iso_n = df.resample(agg_res).apply(weighted_average, col=iso, agg_freq=agg_res)
@@ -260,8 +261,8 @@ print('Correlation: ', (resampled[f'mass standrd {iso}']).corr(resampled[f'mass 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C, Matern
 
-df_gp = pd.concat([df['rainfall (mm/hr)'],df['cumP'], resampled[f'{iso} deseasoned'], df['weekly_obs']], axis=1)
-df_gp['weekly_obs'] = df_gp['weekly_obs'].fillna(False).astype(bool)
+df_gp = pd.concat([data['rainfall (mm/hr)'],data['cumP'], resampled[f'{iso} deseasoned'], data['is_weekly']], axis=1)
+df_gp['is_weekly'] = df_gp['is_weekly'].fillna(False).astype(bool)
 precip_min, precip_max = df_gp.loc[df_gp['rainfall (mm/hr)'] != 0, 'rainfall (mm/hr)'].min(), df_gp['cumP'].max() #st and et of cumP
 df_gp[f'cum mass {iso} deseasoned'] = (df_gp[f'{iso} deseasoned']*df_gp['rainfall (mm/hr)']).cumsum()
 continuous_precip = pd.DataFrame(np.arange(0.0, precip_max+precip_min, precip_min), columns=['precip_continuous']) # creates an integral cumP with equal intervals for better GP prediction
@@ -274,7 +275,7 @@ continuous_precip = pd.DataFrame(np.arange(0.0, precip_max+precip_min, precip_mi
 continuous_precip = np.asarray(continuous_precip).astype(float).ravel()
 
 # 2. FORCE observation cumP to be a 1D numpy array
-mask = np.asarray(df_gp['weekly_obs']).astype(bool)
+mask = np.asarray(df_gp['is_weekly']).astype(bool)
 cumP_obs = np.asarray(df_gp.loc[mask, 'cumP']).astype(float).ravel()
 
 # 3. Map observations to grid
@@ -342,7 +343,7 @@ y_std  = std_fn(Xtest.ravel())
 
 
 # map prediction back to df.index without rounding or merging errors
-cumP = df['cumP'].to_numpy()
+cumP = data['cumP'].to_numpy()
 
 idx = np.searchsorted(continuous_precip, cumP) # value mapping
 idx = np.clip(idx, 1, len(continuous_precip) - 1)
@@ -358,7 +359,7 @@ df_rev = pd.DataFrame(
         "lower": y_mean[idx] - 1.96 * y_std[idx],
         "precip": continuous_precip[idx],
     },
-    index=df.index
+    index=data.index
 )
 
 #%%
@@ -394,7 +395,7 @@ plt.figure(figsize=[15,5])
 plt.scatter(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'mean_c'], color='darkblue', s=10**2, label=f'GP predicted {iso} {agg_res}', marker='.', alpha=0.3, zorder=10)
 plt.fill_between(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'lower_c'], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'upper_c'], 
                  alpha=0.1, color="purple", label="Confidence interval")
-plt.scatter(df.index[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0)], df.loc[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0), iso], color='red', marker='.', s=10**2, label=f'Observed {iso}') #rainfall mask technically isn't needed since weekly_obs only takes rain days
+plt.scatter(df.index[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0)], df.loc[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0), iso], color='red', marker='.', s=10**2, label=f'Observed {iso} {c_res}') #rainfall mask technically isn't needed since weekly_obs only takes rain days
 plt.xlabel('Date')
 plt.ylabel(f'{iso} concentration [‰]')
 plt.title(f'{iso}: GP predicted isotope concentration')
@@ -407,12 +408,14 @@ plt.show()
 #%% #fix this later***
 #-------------------Create resampled data with GP predicted isotope values----------------
 
-S_n = data.resample(agg_res).sum()['snowmelt (mm/hr)']
-D_n = data.resample(agg_res).sum()['discharge (mm/hr)']
-ET_n = data.resample(agg_res).sum()['ET (mm/hr)']
-ORPB18O_n = data.resample(agg_res)['ORPB 18O'].mean()
-df_rev[[f'snowmelt (mm/{agg_res})', f'snowfall SWE (mm/{agg_res})', f'discharge (mm/{agg_res})', 'storage (mm)', f'ET (mm/{agg_res})', f'baseflow 1 (mm/{agg_res})', 'ORPB 18O', 'ORPB 2H', 'is_weekly']] = data.resample(agg_res).agg({'snowmelt (mm/hr)': 'sum', 'snowfall SWE (mm/hr)': 'sum', 'discharge (mm/hr)': 'sum',  'storage (mm)': 'mean', 'ET (mm/hr)': 'sum', 'baseflow 1 (mm/hr)': 'sum', 'ORPB 18O': 'mean', 'ORPB 2H': 'mean', 'is_weekly': 'any'})
+# S_n = data.resample(agg_res).sum()['snowmelt (mm/hr)']
+# D_n = data.resample(agg_res).sum()['discharge (mm/hr)']
+# ET_n = data.resample(agg_res).sum()['ET (mm/hr)']
+# ORPB18O_n = data.resample(agg_res)['ORPB 18O'].mean()
+# df_rev[[f'snowmelt (mm/{agg_res})', f'snowfall SWE (mm/{agg_res})', f'discharge (mm/{agg_res})', 'storage (mm)', f'ET (mm/{agg_res})', f'baseflow 1 (mm/{agg_res})', 'ORPB 18O', 'ORPB 2H', 'is_weekly']] = data.resample(agg_res).agg({'snowmelt (mm/hr)': 'sum', 'snowfall SWE (mm/hr)': 'sum', 'discharge (mm/hr)': 'sum',  'storage (mm)': 'mean', 'ET (mm/hr)': 'sum', 'baseflow 1 (mm/hr)': 'sum', 'ORPB 18O': 'mean', 'ORPB 2H': 'mean', 'is_weekly': 'any'})
+# This is an issue, we want the same dataframe, data, just add the new columns from df_rev to it
 
+data = data.join(df_rev[['mean_c', 'lower_c', 'upper_c']])
 
 # %%
 # save to csv files
@@ -424,23 +427,25 @@ import os
 if not os.path.exists(resolution_dataset_root):
     os.makedirs(resolution_dataset_root)
 
-df_rev.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{iso}_{resolution}.csv")
+# df_rev.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{iso}_{resolution}.csv")
 # df_rev.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_sinusoid_{iso}_{resolution}.csv")
 
+data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{resolution}_{iso}.csv")
 # %%
 
 
 
 # additonal visualization
-resolution = 'daily'
+# note: rerun agg_res and c_res df creation block
+resolution = 'biweekly'
 resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
-df_rev = pd.read_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{iso}_{resolution}.csv", index_col=0, parse_dates=[0])
+df_rev = pd.read_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{resolution}_{iso}.csv", index_col=0, parse_dates=[0])
 
-plt.figure(figsize=[10,5])
-plt.scatter(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'mean_c'], color='darkblue', s=10**2, label=f'GP predicted {iso} {agg_res}', marker='.', alpha=0.3, zorder=10)
-plt.fill_between(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'lower_c'], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'upper_c'], 
+plt.figure(figsize=[15,5])
+plt.scatter(df_rev.index[df_rev[f'rainfall (mm/hr)']>0], df_rev.loc[df_rev[f'rainfall (mm/hr)']>0, 'mean_c'], color='darkblue', s=10**2, label=f'GP predicted {iso} {agg_res}', marker='.', alpha=0.3, zorder=10)
+plt.fill_between(df_rev.index[df_rev[f'rainfall (mm/hr)']>0], df_rev.loc[df_rev[f'rainfall (mm/hr)']>0, 'lower_c'], df_rev.loc[df_rev[f'rainfall (mm/hr)']>0, 'upper_c'], 
                  alpha=0.1, color="purple", label="Confidence interval")
-plt.scatter(df.index[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0)], df.loc[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0), iso], color='red', marker='.', s=10**2, label=f'Observed {iso}') #rainfall mask technically isn't needed since weekly_obs only takes rain days
+plt.scatter(df.index[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0)], df.loc[(df['weekly_obs']==True) & (df['rainfall (mm/hr)']>0), iso], color='red', marker='.', s=10**2, label=f'Observed {iso} {c_res}') #rainfall mask technically isn't needed since weekly_obs only takes rain days
 plt.xlabel('Date')
 plt.ylabel(f'{iso} concentration [‰]')
 plt.title(f'{iso}: GP predicted isotope concentration')
