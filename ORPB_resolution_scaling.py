@@ -144,7 +144,7 @@ print('Correlation: ', pisotopes_obs[iso].corr(pisotopes_agg[iso]))
 # ---------------upsample using GP minus trend----------------
 
 # First, define data with coarse resolution to new resolution with weighted average on the isotope data
-c_res = '2W' #hourly (h), daily (D), weekly (W), biweekly (2W), monthly (ME) #EDIT HERE depending on agg_res
+c_res = 'W' #hourly (h), daily (D), weekly (W), biweekly (2W), monthly (ME) #EDIT HERE depending on agg_res
 precip = data['rainfall (mm/hr)'].resample(c_res).sum()
 precip.name = 'rainfall (mm/hr)'
 precip = precip.apply(lambda x: round(x/2.54e-3)*2.54e-3)
@@ -161,12 +161,23 @@ df['cumP'] = df['cumP'].apply(lambda x: round(x/2.54e-3)*2.54e-3)
 agg_res = 'h'
 
 P_n = df.resample(agg_res).sum()['rainfall (mm/hr)']
-iso_n = df.resample(agg_res).apply(weighted_average, col=iso, agg_freq=agg_res)
+# iso_n = df.resample(agg_res).apply(weighted_average, col=iso, agg_freq=agg_res) #resamples twice
+iso_n = weighted_average(df, col=iso, agg_freq=agg_res)
 resampled = pd.concat([P_n, iso_n], axis=1)
 resampled.columns = ['rainfall (mm/hr)', iso]
 resampled.ffill(inplace=True)
 resampled.bfill(inplace=True)
 t_agg = resampled.index.dayofyear
+
+#%%
+# after this point, created backfilled interpolation, otherwise skip to trend removal for GP interpolation
+# resampled['mean_c'] = resampled[iso]
+# data = data.join(resampled['mean_c'])
+# data['mean_c'] = data['mean_c'].bfill().ffill()
+# resolution='monthly' #c_res = 'W' (original), agg_res = 'ME' for monthly
+# resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
+# data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_bfill_{resolution}_{iso}.csv")
+
 
 #----CHOOSE METHOD FOR TREND REMOVAL: Method I: isoMAP based trend, Method II: sinusoidal trend
 #%%
@@ -437,7 +448,7 @@ data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{resolution}_{i
 
 # additonal visualization
 # note: rerun agg_res and c_res df creation block
-resolution = 'biweekly'
+resolution = 'weekly'
 resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
 df_rev = pd.read_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{resolution}_{iso}.csv", index_col=0, parse_dates=[0])
 
@@ -471,5 +482,32 @@ ax.legend()
 ax1.legend()
 ax.set_xlim([pd.Timestamp('2014-08-01'), pd.Timestamp('2015-08-01')])
 ax1.set_xlim([pd.Timestamp('2014-08-01'), pd.Timestamp('2015-08-01')])
+plt.tight_layout()
+# %%
+
+
+
+# plot with Olin hall daily data
+  
+
+df_oh = pd.read_csv("olin_hall_precip.csv", index_col=1, parse_dates=True)
+starttime = max(df_oh.index[0], df.index[0])
+endtime = min(df_oh.index[-1], df.index[-1])
+
+plt.figure(figsize=(16, 7))
+plt.plot(
+    df_oh[f"O18_daily"][df_oh["daily obs"] == True],
+    ".",
+    color="orange",
+    ms=10,
+    label="Olin Hall daily observation",
+)
+plt.plot(
+    df_rev["mean_c"], ".", color="red", label=f"Predicted daily from {resolution} resolution"
+)
+plt.legend(ncol=5, frameon=False)
+plt.title(r"$^{18}O$", fontsize=16)
+plt.xlim([starttime, endtime])
+# fig.supylabel("Delta isotope concentration (‰)", fontsize=16)
 plt.tight_layout()
 # %%
