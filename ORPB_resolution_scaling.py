@@ -12,9 +12,10 @@ data = pd.read_csv('ORPB_isotope_data.csv', index_col=0, parse_dates=[0]) #len 5
 # data = data.loc[pd.Timestamp('2014-01-01'): pd.Timestamp('2014-07-01')]
 
 # clean up and find missing samples
-data = data.drop(data[data['Sample Name'].isna()].index)
+data = data.drop(data[data['Sample Name'].isna()].index) #drop last week of data with no isotope samples and no rain - still keeps h res
 issample = ~data.loc[data['rainfall (mm/hr)']>0, 'Sample Name'].duplicated(keep='last')
 data['is_weekly'] = issample
+data.loc[data['is_weekly'].isna(), 'is_weekly'] = False #when rain is 0, set to False
 data['cumP'] = data['rainfall (mm/hr)'].cumsum()
 #%% ----------------stream isotopes-------------------------------------------------
 # note: if using stream isotopes, need to change the mass flux calculation to use discharge instead of precipitation
@@ -75,7 +76,7 @@ else:
     ison = 3
 
 def weighted_average(df, col='precip 2H', agg_freq='W'):
-    weighted_avg = df[col].mul(df['rainfall (mm/hr)']).resample(agg_freq).sum() / df['rainfall (mm/hr)'].resample(agg_freq).sum()
+    weighted_avg = df[col].mul(df['rainfall (mm/hr)']).resample(agg_freq).sum(min_count=1) / df['rainfall (mm/hr)'].resample(agg_freq).sum()
     return weighted_avg
 
 #%%
@@ -144,16 +145,19 @@ print('Correlation: ', pisotopes_obs[iso].corr(pisotopes_agg[iso]))
 # ---------------upsample using GP minus trend----------------
 
 # First, define data with coarse resolution to new resolution with weighted average on the isotope data
-c_res = 'W' #hourly (h), daily (D), weekly (W), biweekly (2W), monthly (ME) #EDIT HERE depending on agg_res
+c_res = 'ME' #hourly (h), daily (D), weekly (W), biweekly (2W), monthly (ME) #EDIT HERE depending on agg_res
 precip = data['rainfall (mm/hr)'].resample(c_res).sum()
 precip.name = 'rainfall (mm/hr)'
 precip = precip.apply(lambda x: round(x/2.54e-3)*2.54e-3)
-c_iso = data[[iso, 'Sample Name']].asfreq(c_res) #just reindex no change to values
+c_iso = weighted_average(data, col=iso, agg_freq=c_res) #better to use weighted average to aggregate before downsampling
+c_iso = pd.concat([c_iso,data['Sample Name'].asfreq(c_res)],axis=1) #just reindex no change to values
+c_iso.columns = [iso, 'Sample Name']
 df = pd.concat([precip, c_iso],axis=1).loc[c_iso.index]
 df['weekly_obs'] = ~df.loc[df['rainfall (mm/hr)']>0, 'Sample Name'].duplicated(keep='last') # make sure weekly values are only for when rain was actually observed (1066 obs values vs only 235 when observed without rain restriction)
-df['weekly_obs'] = df['weekly_obs'].fillna(False) #set non-masked values to False i.e. where no rain observedc
+df.loc[df['weekly_obs'].isna(), 'weekly_obs'] = False #set non-masked values to False i.e. where no rain observed
 df.loc[df['weekly_obs']==False, iso] = np.nan # set non-weekly observed isotope values to nan so they don't influence GP fit
-df.ffill(inplace=True) # does the previous step do anything if we just ffill? maybe not, we still use the weekly_obs mask for GP prediction
+df.bfill(inplace=True)
+df.ffill(inplace=True) #to get last 23 rows of data that have zero rainfall
 df['cumP'] = df['rainfall (mm/hr)'].cumsum()
 df['cumP'] = df['cumP'].apply(lambda x: round(x/2.54e-3)*2.54e-3)
 
@@ -161,26 +165,29 @@ df['cumP'] = df['cumP'].apply(lambda x: round(x/2.54e-3)*2.54e-3)
 agg_res = 'h'
 
 P_n = df.resample(agg_res).sum()['rainfall (mm/hr)']
-# iso_n = df.resample(agg_res).apply(weighted_average, col=iso, agg_freq=agg_res) #resamples twice
-iso_n = weighted_average(df, col=iso, agg_freq=agg_res)
-resampled = pd.concat([P_n, iso_n], axis=1)
-resampled.columns = ['rainfall (mm/hr)', iso]
-resampled.ffill(inplace=True)
+iso_n = df[[iso, 'Sample Name']].asfreq(agg_res) #just reindex to finer res no change to values, does the same thing as just assigning the coarse res column to the finer res df
+resampled = data.copy()
+resampled['is_weekly'] = df['weekly_obs'] #makes mask match coarse data
+resampled.loc[resampled['is_weekly'].isna(), 'is_weekly'] = False
+resampled[iso] = iso_n[iso]
 resampled.bfill(inplace=True)
+resampled.ffill(inplace=True)
 t_agg = resampled.index.dayofyear
+
+#note: after checking data[iso] and resampled[iso], they are very different post 2019-06-10 because there is no rain, but data[iso] still somehow has observations.
 
 #%%
 # after this point, created backfilled interpolation, otherwise skip to trend removal for GP interpolation
 # resampled['mean_c'] = resampled[iso]
 # data = data.join(resampled['mean_c'])
 # data['mean_c'] = data['mean_c'].bfill().ffill()
-# resolution='monthly' #c_res = 'W' (original), agg_res = 'ME' for monthly
+# resolution='monthly' # == c_res to indicate the resolution of the coarse iso
 # resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
 # data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_bfill_{resolution}_{iso}.csv")
 
-
-#----CHOOSE METHOD FOR TREND REMOVAL: Method I: isoMAP based trend, Method II: sinusoidal trend
 #%%
+#----CHOOSE METHOD FOR TREND REMOVAL: Method I: isoMAP based trend, Method II: sinusoidal trend
+
 #Use Method I: isoMAP based trend
 isomap = pd.read_csv('isomap.csv')
 isomap = isomap[['H2_PB', 'O18_PB']]
@@ -271,9 +278,11 @@ print('Correlation: ', (resampled[f'mass standrd {iso}']).corr(resampled[f'mass 
 # Now fit GP regressor to M(t) and precip
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C, Matern
+from sklearn.preprocessing import StandardScaler
+gp_alpha = 1e-6 #change to smallest value that doesn't give ABNORMAL and also LOO coverage and mean Z in next block
 
-df_gp = pd.concat([data['rainfall (mm/hr)'],data['cumP'], resampled[f'{iso} deseasoned'], data['is_weekly']], axis=1)
-df_gp['is_weekly'] = df_gp['is_weekly'].fillna(False).astype(bool)
+df_gp = pd.concat([data['rainfall (mm/hr)'],data['cumP'], resampled[f'{iso} deseasoned'], resampled['is_weekly']], axis=1)
+df_gp['is_weekly'] = df_gp['is_weekly'].fillna(False).infer_objects(copy=False).astype(bool) #infer_objects forces the type without silently downcasting that pandas will depreciate
 precip_min, precip_max = df_gp.loc[df_gp['rainfall (mm/hr)'] != 0, 'rainfall (mm/hr)'].min(), df_gp['cumP'].max() #st and et of cumP
 df_gp[f'cum mass {iso} deseasoned'] = (df_gp[f'{iso} deseasoned']*df_gp['rainfall (mm/hr)']).cumsum()
 continuous_precip = pd.DataFrame(np.arange(0.0, precip_max+precip_min, precip_min), columns=['precip_continuous']) # creates an integral cumP with equal intervals for better GP prediction
@@ -295,83 +304,120 @@ idx = np.clip(idx, 0, continuous_precip.size - 1)
 
 # 4. Build X and y (both numpy arrays)
 X = continuous_precip.take(idx).reshape(-1, 1)
+x_scaler = StandardScaler()
+Xs = x_scaler.fit_transform(X) #scale the input
 y = np.asarray(df_gp.loc[mask, f'cum mass {iso} deseasoned']).astype(float).ravel()
 
+#%%
+# --- OLD: per-point measurement alpha for use with RBF + learned WhiteKernel. Kept for reference.
+# ---------- per-observation measurement-error variance (alpha array) ----------
+# LGR 1-SD analytical precision for 18O (per mil).
+# sigma_18O = 0.25  # ‰
 
-# Kernel = constant * RBF + noise
-kernel = C(1.0, (1e-2, 1e2)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2)) \
-         + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-5, 1e1))
+# # Each weekly sample's measured value is forward-filled (line ~171) across a block
+# # of hourly rows until the next sample, so the SAME measurement error applies to
+# # every hour in that block. Block j therefore contributes (sigma * W_j) to the
+# # cumulative mass, where W_j is the total rainfall its value is applied to.
+# raw_iso = resampled[iso].reindex(df_gp.index)                 # ffilled, piecewise-constant
+# block_id = (raw_iso != raw_iso.shift()).cumsum()              # one id per sample's block
 
-gp = GaussianProcessRegressor(kernel=Matern(), alpha=0.0000001, n_restarts_optimizer=50, normalize_y=True)
+# # rainfall carried by each block (ignore rows before the first sample, where iso is NaN)
+# rain_valid = df_gp['rainfall (mm/hr)'].where(raw_iso.notna(), 0.0)
+# block_W = rain_valid.groupby(block_id).sum()                  # W_j per block [mm]
+
+# # independent per-block errors accumulate: Var(cum mass at k) = sigma^2 * sum_{j<=k} W_j^2
+# cum_var_by_block = (sigma_18O ** 2) * (block_W ** 2).cumsum()  # [‰^2 mm^2]
+# var_per_row = block_id.map(cum_var_by_block).to_numpy()
+# alpha_meas = var_per_row[mask]                               # aligned to y
+
+# # normalize_y=True rescales y by its std (ddof=0), so alpha must live in that space
+# alpha_norm = alpha_meas / np.var(y)
+# alpha_norm = np.clip(alpha_norm, 1e-10, None)               # keep strictly positive
+# # -----------------------------------------------------------------------------
+
+
+#%%
+# --- Esther's reconstruction: plain Matern (nu=1.5), fixed tiny jitter, NO WhiteKernel. ---
+# StandardScaler is kept only for numerical stability; Matern default length-scale bounds
+# (1e-5, 1e5) are wide enough that scaling does not distort the fit vs her unscaled setup.
+kernel = Matern()
+# alpha regularizes the (near-singular) kernel matrix. Esther used 1e-7, but her 12H data was
+# better conditioned; your closely-spaced hourly cumP points need more jitter or L-BFGS fails
+# (ABNORMAL). 1e-3 ~ the noise the WhiteKernel previously found. Lower it toward 1e-5 if it
+# still converges cleanly (smaller = closer to Esther); raise it if ABNORMAL persists.
+#"jitter raised from Esther's 1e-7 to 1e-6 for numerical stability on the higher-resolution hourly data; selected by LOO calibration."
+gp = GaussianProcessRegressor(kernel=kernel, alpha=gp_alpha, n_restarts_optimizer=50, normalize_y=True)
+
+# --- OLD (calibrated) setup: RBF + learned WhiteKernel + per-point measurement alpha. Kept for reference.
+# kernel = C(1.0, (1e-2, 1e2)) * RBF(length_scale=1.0, length_scale_bounds=(3e-1, 1e2)) \
+#          + WhiteKernel(noise_level=1e-1, noise_level_bounds=(1e-3, 1e2))
+# gp = GaussianProcessRegressor(kernel=kernel, alpha=alpha_norm, n_restarts_optimizer=50, normalize_y=True)
 
 # Fit GP to data
-gp.fit(X, y)
+gp.fit(Xs, y)
+print('fitted kernel:', gp.kernel_)
 
+#%% ---------------- validate uncertainty: leave-one-out coverage ----------------
+# Refit with the ALREADY-optimized kernel (optimizer=None) dropping each point, then
+# check what fraction of held-out observations land inside their 95% predictive band.
+# ~95% coverage & mean|z|~0.8 => uncertainty is calibrated; far below => band too narrow.
+n = len(y)
+loo_mean = np.empty(n)
+loo_std  = np.empty(n)
+for i in range(n):
+    keep = np.arange(n) != i
+    g = GaussianProcessRegressor(kernel=gp.kernel_, optimizer=None,
+                                 alpha=gp_alpha, normalize_y=True)  # match the fixed-jitter fit
+    g.fit(Xs[keep], y[keep])
+    m, s = g.predict(Xs[i].reshape(1, -1), return_std=True)
+    loo_mean[i], loo_std[i] = m[0], s[0]
+
+# predictive std for a held-out OBSERVATION: latent + WhiteKernel(repr) + its own measurement var
+sigma_pred = np.sqrt(loo_std**2)# + alpha_meas)          # alpha_meas is in y-units (‰·mm)^2
+z = (y - loo_mean) / sigma_pred
+print(f'95% LOO coverage: {np.mean(np.abs(z) <= 1.96):.1%}  (target ~95%)') # >>95% bands are overcovering, <<95% (40-70) bands are too narrow
+print(f'mean |z|:         {np.mean(np.abs(z)):.2f}  (target ~0.80 if calibrated)') #average standardized residual. <<0.8 band too wide, >>1 residuals are bigger than band claims 
+
+#%%
 # Predict on test points
 # Xtest = df_gp['precip_continuous'].values.reshape(-1, 1)
-Xtest = continuous_precip.reshape(-1,1)
-# y_mean, y_std = gp.predict(Xtest, return_std=True)
-
-# # to save memory can predict in batches if Xtest is too large
-# def predict_in_batches(gp, X_test, batch_size=500):
-#     means, stds = [], []
-#     for i in range(0, len(X_test), batch_size):
-#         batch = X_test[i:i+batch_size]
-#         m, s = gp.predict(batch, return_std=True)
-#         means.append(m)
-#         stds.append(s)
-#     return np.concatenate(means), np.concatenate(stds)
-
-# y_mean, y_std = predict_in_batches(gp, Xtest, batch_size=500)
-
-# or can subsample training data more aggressively since input is 1D and smooth
-# predict on fine grid, then interpolate
-# Predict on a coarse grid
-grid = np.linspace(Xtest.min(), Xtest.max(), 2000).reshape(-1, 1)
-y_mean_grid, y_std_grid = gp.predict(grid, return_std=True)
-
-# Interpolate back to original resolution
-from scipy.interpolate import interp1d
-mean_fn = interp1d(grid.ravel(), y_mean_grid, kind='cubic')
-std_fn  = interp1d(grid.ravel(), y_std_grid,  kind='cubic')
-
-y_mean = mean_fn(Xtest.ravel())
-y_std  = std_fn(Xtest.ravel())
-
-
-# map predictions back to df.index -- this method rounds cumP and trys to merge which can shift predictions and mismatch upper/lower bounds
-# time_map = np.round(df['cumP']/precip_min) * precip_min
-# df_rev = pd.DataFrame(
-#     {
-#         "mean": np.round(y_mean, 5),
-#         "upper": np.round(y_mean+1.96*y_std, 5),
-#         "lower": np.round(y_mean-1.96*y_std, 5),
-#         "precip": Xtest.flatten(),
-#     }
-# ).drop_duplicates()
-# df_rev = df_rev.merge(pd.DataFrame(time_map), left_on='precip', right_on='cumP', how='right')
-# df_rev.index = df.index
-
-
-# map prediction back to df.index without rounding or merging errors
-cumP = data['cumP'].to_numpy()
-
-idx = np.searchsorted(continuous_precip, cumP) # value mapping
-idx = np.clip(idx, 1, len(continuous_precip) - 1)
-# map each time to nearest grid index
-left = continuous_precip[idx - 1]
-right = continuous_precip[idx]
-idx -= (cumP - left) < (right - cumP) # choose the nearest value in value space
+# --- Direct prediction at each timestamp's cumP (no giant grid / interpolation needed) ---
+# We only ever use predictions at data.index, so predict there directly. K_trans is
+# (n, n_train) in memory (~cheap), avoiding the memory blow-up from predicting on the
+# full, millions-long continuous_precip. precip is the EXACT cumP (no rounding/snapping).
+X_pred = x_scaler.transform(data['cumP'].to_numpy().reshape(-1, 1))
+y_mean, y_std = gp.predict(X_pred, return_std=True)
 
 df_rev = pd.DataFrame(
     {
-        "mean": y_mean[idx],
-        "upper": y_mean[idx] + 1.96 * y_std[idx],
-        "lower": y_mean[idx] - 1.96 * y_std[idx],
-        "precip": continuous_precip[idx],
+        "mean":  y_mean,
+        "upper": y_mean + 1.96 * y_std,
+        "lower": y_mean - 1.96 * y_std,
+        "precip": data['cumP'].to_numpy(),
     },
-    index=data.index
+    index=data.index,
 )
+
+# --- OLD: coarse-grid predict + cubic interpolation + searchsorted map-back. Needed ONLY
+# --- for the MC latent-sampling band (return_cov cannot be formed at ~44k points). Restore
+# --- this block (defines Xtests / grid / idx) if you switch back to the rigorous MC band.
+# Xtest = continuous_precip.reshape(-1, 1)
+# Xtests = x_scaler.transform(Xtest)
+# from scipy.interpolate import interp1d
+# grid = np.linspace(Xtests.min(), Xtests.max(), 2000).reshape(-1, 1)
+# y_mean_grid, y_std_grid = gp.predict(grid, return_std=True)
+# mean_fn = interp1d(grid.ravel(), y_mean_grid, kind='cubic')
+# std_fn  = interp1d(grid.ravel(), y_std_grid,  kind='cubic')
+# y_mean = mean_fn(Xtests.ravel()); y_std = std_fn(Xtests.ravel())
+# cumP = data['cumP'].to_numpy()
+# idx = np.searchsorted(continuous_precip, cumP)
+# idx = np.clip(idx, 1, len(continuous_precip) - 1)
+# idx -= (cumP - continuous_precip[idx - 1]) < (continuous_precip[idx] - cumP)
+# df_rev = pd.DataFrame(
+#     {"mean": y_mean[idx], "upper": y_mean[idx] + 1.96 * y_std[idx],
+#      "lower": y_mean[idx] - 1.96 * y_std[idx], "precip": continuous_precip[idx]},
+#     index=data.index,
+# )
 
 #%%
 # ---------------plot GP predicted deseasoned mass fluxes----------------
@@ -392,6 +438,8 @@ plt.show()
 df_rev[f'rainfall (mm/{agg_res})'] = df_rev['precip'].diff()
 df_rev.loc[df_rev.index[0], f'rainfall (mm/{agg_res})'] = 0.0
 df_rev['iso_fit'] = iso_fit
+# --- Esther concentration band: differenced the cumulative-mass ENVELOPE, which drops the
+# --- covariance between adjacent points and collapses the band.
 df_rev['mean_c'] = df_rev['mean'] + (df_rev['iso_fit']*df_rev[f'rainfall (mm/{agg_res})']).cumsum()
 df_rev['mean_c'] = df_rev['mean_c'].diff()/(df_rev[f'rainfall (mm/{agg_res})']+1e-6)
 df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']==0, 'mean_c'] = np.nan
@@ -401,6 +449,41 @@ df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']==0, 'upper_c'] = np.nan
 df_rev['lower_c'] = df_rev['lower'] + (df_rev['iso_fit']*df_rev[f'rainfall (mm/{agg_res})']).cumsum()
 df_rev['lower_c'] = df_rev['lower_c'].diff()/(df_rev[f'rainfall (mm/{agg_res})']+1e-6)
 df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']==0, 'lower_c'] = np.nan
+
+# --- OLD: if using RBF kernel ->concentration band by Monte-Carlo through the derivative ---
+# Draw posterior samples of the cumulative-mass curve and differentiate EACH sample,
+# then take percentiles. This propagates the full correlated posterior correctly.
+# mean_c stays the deterministic GP mean; only the band comes from the samples.
+# df_rev['mean_c'] = df_rev['mean'] + (df_rev['iso_fit']*df_rev[f'rainfall (mm/{agg_res})']).cumsum()
+# df_rev['mean_c'] = df_rev['mean_c'].diff()/(df_rev[f'rainfall (mm/{agg_res})']+1e-6)
+# df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']==0, 'mean_c'] = np.nan
+
+# N = 300
+# # Sample the LATENT cumulative-mass function (exclude WhiteKernel noise): predict the full
+# # posterior covariance, subtract the observation-noise variance off the diagonal, then draw.
+# # Latent samples are smooth, so differentiating them does not amplify iid noise into an
+# # exploding band (which is what gp.sample_y did -- it includes the WhiteKernel).
+# mean_g, cov_g = gp.predict(grid, return_cov=True)                   # y-units, incl. WhiteKernel on diag
+# noise_var_y = gp.kernel_.k2.noise_level * np.var(y)                 # WhiteKernel var, back to y-units
+# cov_latent = cov_g - noise_var_y * np.eye(len(mean_g))             # remove observation noise
+# cov_latent = (cov_latent + cov_latent.T) / 2 + 1e-8 * np.eye(len(mean_g))  # symmetrize + jitter for PSD
+# rng = np.random.default_rng(0)
+# M_grid_samples = rng.multivariate_normal(mean_g, cov_latent, size=N, method='eigh').T  # (len(grid), N)
+# samp_fn = interp1d(grid.ravel(), M_grid_samples, axis=0, kind='cubic', fill_value='extrapolate')
+# M_rev = samp_fn(Xtests.ravel())[idx, :]                             # (len(df_rev), N) at df_rev rows
+
+# dP = df_rev[f'rainfall (mm/{agg_res})'].to_numpy()                  # ΔcumP per row
+# iso_fit_arr = df_rev['iso_fit'].to_numpy()
+# # concentration = d(deseasoned cum mass)/dP + seasonal fit. Differencing the seasonal
+# # cumsum reduces to just adding iso_fit back, so no cumsum is needed -- which also avoids
+# # np.cumsum propagating a single NaN across the whole column (the old pandas .cumsum skipped NaNs).
+# C_samples = np.diff(M_rev, axis=0) / (dP[1:, None] + 1e-6) + iso_fit_arr[1:, None]
+# C_samples = np.vstack([np.full((1, N), np.nan), C_samples])        # align, first row NaN
+
+# print('M_rev all finite?', np.isfinite(M_rev).all(), '| iso_fit NaNs:', np.isnan(iso_fit_arr).sum())
+# df_rev['lower_c'] = np.nanpercentile(C_samples, 2.5, axis=1)
+# df_rev['upper_c'] = np.nanpercentile(C_samples, 97.5, axis=1)
+# df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']==0, ['lower_c', 'upper_c']] = np.nan
 
 plt.figure(figsize=[15,5])
 plt.scatter(df_rev.index[df_rev[f'rainfall (mm/{agg_res})']>0], df_rev.loc[df_rev[f'rainfall (mm/{agg_res})']>0, 'mean_c'], color='darkblue', s=10**2, label=f'GP predicted {iso} {agg_res}', marker='.', alpha=0.3, zorder=10)
@@ -431,7 +514,7 @@ data = data.join(df_rev[['mean_c', 'lower_c', 'upper_c']])
 # %%
 # save to csv files
 
-resolution = 'monthly' #bimonthly, weekly, daily, monthly #EDIT HERE depending on agg_res
+resolution = 'hourly' #bimonthly, weekly, daily, monthly #EDIT HERE depending on agg_res
 
 resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
 import os
@@ -441,7 +524,7 @@ if not os.path.exists(resolution_dataset_root):
 # df_rev.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{iso}_{resolution}.csv")
 # df_rev.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_sinusoid_{iso}_{resolution}.csv")
 
-data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_isoMAP_{resolution}_{iso}.csv")
+data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_bfill_{resolution}_{iso}.csv")
 # %%
 
 
