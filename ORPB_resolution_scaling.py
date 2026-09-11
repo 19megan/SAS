@@ -13,10 +13,23 @@ data = pd.read_csv('ORPB_isotope_data.csv', index_col=0, parse_dates=[0]) #len 5
 
 # clean up and find missing samples
 data = data.drop(data[data['Sample Name'].isna()].index) #drop last week of data with no isotope samples and no rain - still keeps h res
-issample = ~data.loc[data['rainfall (mm/hr)']>0, 'Sample Name'].duplicated(keep='last')
+issample = ~data.loc[data['rainfall (mm/hr)']>0, 'Sample Name'].duplicated(keep='last') #with precip (rain+snowfallSWE) >0, keeps ORPR-115 value
 data['is_weekly'] = issample
 data.loc[data['is_weekly'].isna(), 'is_weekly'] = False #when rain is 0, set to False
 data['cumP'] = data['rainfall (mm/hr)'].cumsum()
+
+#%%
+#------------if agg_res='D', we want data to be daily resolution---------------
+data = data.resample('D').agg({'rainfall (mm/hr)':'sum', 'snowfall SWE (mm/hr)':'sum', 'snowmelt (mm/hr)':'sum', 
+                               'discharge (mm/hr)':'sum', 'storage (mm)':'sum', 'ET (mm/hr)':'sum', 'baseflow 1 (mm/hr)':'sum',
+                                 'baseflow 2 (mm/hr)':'sum', 'Sample Name': 'last', 'precip 2H': 'mean', 'precip 2H StDev':'mean', 
+                                 'precip 18O':'mean', 'precip 18O StDev':'mean', 'precip 17O':'mean', 'precip 17O StDev':'mean', 
+                                 'ORPB 2H':'mean', 'ORPB 2H StDev':'mean', 'ORPB 18O':'mean', 'ORPB 18O StDev':'mean', 'ORPB 17O':'mean',
+                                 'ORPB 17O StDev':'mean', 'is_weekly': 'any', 'cumP':'sum'})
+
+#technically, columns with mm/hr are now mm/D since I summed them on aggregation
+
+
 #%% ----------------stream isotopes-------------------------------------------------
 # note: if using stream isotopes, need to change the mass flux calculation to use discharge instead of precipitation
 # isotopes = data[['ORPB 2H', 'ORPB 18O', 'ORPB 17O']]
@@ -145,7 +158,7 @@ print('Correlation: ', pisotopes_obs[iso].corr(pisotopes_agg[iso]))
 # ---------------upsample using GP minus trend----------------
 
 # First, define data with coarse resolution to new resolution with weighted average on the isotope data
-c_res = 'ME' #hourly (h), daily (D), weekly (W), biweekly (2W), monthly (ME) #EDIT HERE depending on agg_res
+c_res = 'W' #hourly (h), daily (D), weekly (W), biweekly (2W), monthly (ME) #EDIT HERE depending on agg_res
 precip = data['rainfall (mm/hr)'].resample(c_res).sum()
 precip.name = 'rainfall (mm/hr)'
 precip = precip.apply(lambda x: round(x/2.54e-3)*2.54e-3)
@@ -162,7 +175,7 @@ df['cumP'] = df['rainfall (mm/hr)'].cumsum()
 df['cumP'] = df['cumP'].apply(lambda x: round(x/2.54e-3)*2.54e-3)
 
 # define aggregation resolution
-agg_res = 'h'
+agg_res = 'D'
 
 P_n = df.resample(agg_res).sum()['rainfall (mm/hr)']
 iso_n = df[[iso, 'Sample Name']].asfreq(agg_res) #just reindex to finer res no change to values, does the same thing as just assigning the coarse res column to the finer res df
@@ -181,9 +194,9 @@ t_agg = resampled.index.dayofyear
 # resampled['mean_c'] = resampled[iso]
 # data = data.join(resampled['mean_c'])
 # data['mean_c'] = data['mean_c'].bfill().ffill()
-# resolution='monthly' # == c_res to indicate the resolution of the coarse iso
+# resolution='weekly' # == c_res to indicate the resolution of the coarse iso
 # resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
-# data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_bfill_{resolution}_{iso}.csv")
+# data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_bfill_{iso}_{resolution}.csv")
 
 #%%
 #----CHOOSE METHOD FOR TREND REMOVAL: Method I: isoMAP based trend, Method II: sinusoidal trend
@@ -279,7 +292,7 @@ print('Correlation: ', (resampled[f'mass standrd {iso}']).corr(resampled[f'mass 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C, Matern
 from sklearn.preprocessing import StandardScaler
-gp_alpha = 1e-6 #change to smallest value that doesn't give ABNORMAL and also LOO coverage and mean Z in next block
+gp_alpha = 1e-7 #change to smallest value that doesn't give ABNORMAL and also LOO coverage and mean Z in next block
 
 df_gp = pd.concat([data['rainfall (mm/hr)'],data['cumP'], resampled[f'{iso} deseasoned'], resampled['is_weekly']], axis=1)
 df_gp['is_weekly'] = df_gp['is_weekly'].fillna(False).infer_objects(copy=False).astype(bool) #infer_objects forces the type without silently downcasting that pandas will depreciate
