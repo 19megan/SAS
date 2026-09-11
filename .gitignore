@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 *.so
 *.pkl
+.vscode/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -20,3 +21,10 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+
+
+papers/
+NN_experiments/
+olin_hall_precip.csv
+results_df.csv
