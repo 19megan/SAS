@@ -16,13 +16,9 @@ from permetrics.regression import RegressionMetric
 #or use resolution data
 res = 'D'
 resolution = 'daily'
-data_df = pd.read_csv(f"/Users/simon/Desktop/ORPB_resolution_datasets/ORPB_isotope_data_isoMAP_precip 18O_{resolution}.csv", index_col=0, parse_dates=[0])
+data_df = pd.read_csv(f"/Users/simon/Desktop/ORPB_resolution_datasets/ORPB_isotope_data_bfill_precip 18O_{resolution}.csv", index_col=0, parse_dates=[0])
 data_df['precip 18O'] = data_df['mean_c']
-data_df['discharge (mm/hr)'] = data_df[f'discharge (mm/{res})'] # for convenience now
-data_df['baseflow 1 (mm/hr)'] = data_df[f'baseflow 1 (mm/{res})']
-data_df['snowmelt (mm/hr)'] = data_df[f'snowmelt (mm/{res})']
-data_df['rainfall (mm/hr)'] = data_df[f'rainfall (mm/{res})']
-data_df['ET (mm/hr)'] = data_df[f'ET (mm/{res})']
+
 
 #%% plot timeseries of full data (Figure 1 in my dissertation proposal)
 fig,(ax1,ax2, ax3)=plt.subplots(nrows=3,ncols=1,figsize=[10,9])
@@ -74,8 +70,9 @@ plt.show()
 
 #%%
 # data_df = data_df.loc[pd.Timestamp('2014-01-01'): pd.Timestamp('2018-09-21')] # 80% training data (data_df.iloc[int(len(data_df)*0.8)])
-# data_df = data_df.loc[pd.Timestamp('2014-01-01'): pd.Timestamp('2014-12-31')] #subset to Putnam's data range 2014-08-01 - 2016-08-31
+# data_df = data_df.loc[pd.Timestamp('2015-01-01'): pd.Timestamp('2015-12-31 23:00:00')] #subset to Putnam's data range 2014-08-01 - 2016-08-31
 issample = np.logical_not(np.isnan(data_df['ORPB 18O']))
+# res='h1Y'
 #--------influx----------
 # df['influx (mm/hr)'] = df['rainfall (mm/hr)']
 # df['influx (mm/hr)'] = df[['rainfall (mm/hr)','snowfall SWE (mm/hr)','snowmelt (mm/hr)']].sum(axis=1)
@@ -124,7 +121,7 @@ mean = data_df['precip 18O'].mean()
 df= data_df.copy() #make a copy of the data_df
 # df.loc[df['precip 18O'].isna()==True, 'precip 18O']=mean
 # Instead of filling with mean, use forward/backward fill or interpolation
-df['precip 18O'] = df['precip 18O'].ffill().bfill()
+df['precip 18O'] = df['precip 18O'].bfill().ffill()
 
 # assert positive ET values
 # df.loc[df['ET (mm/hr)']<0, 'ET (mm/hr)']=0
@@ -241,14 +238,18 @@ def make_kumar_model_from(params): # for kumaraswamy distribution
     return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)')
 
 def make_Putnam_model_from(params): # from Putnam Chapter 3
-    a_bf, lamda, S_c, S_Tet = params
+    # qf_scale, a_bf, lamda, S_c, et_scale, c18O_old = params #TV
+    qf_scale, a_bf, t_bf, et_scale, c18O_old = params #TIV
     #Normalize parameters
     # S_Tet = np.exp(LnS_Tet)*1530.484 #ensures S_Tet is always positive
     # # c18O_old = c18O_old*(-7.6) #normalize to -7.6
     # t_bf = t_bf*1423.08 # normalize to corrected with >0 ET, storage calc of storage.max=storage.min * bf1_weight.mean
     # make new column that is a parameter * wetness and put into ST max for quickflow
     # df['wwetness'] = df['wetness']*q_max #normalize to wetness
-    df['S_scale'] = lamda*(df['storage (mm)']-S_c) #slope and intercept 
+    # sTmT = pd.read_csv(f'/Users/simon/Desktop/ORPB_resolution_datasets/sT_mT_init_{res}.csv')
+    # df['mT_spinup'] = sTmT['mT_init'].values
+    # sT_init = sTmT['sT_init'].values
+    # df['S_scale'] = lamda*(df['storage (mm)']-S_c) #slope and intercept 
     sas_specs = {
         'discharge (mm/hr)':
             {'qf_weight': # this column in df will be the weight for the quickflow SAS function, and 1 - this column will be the weight for the baseflow 1 SAS function:
@@ -257,15 +258,16 @@ def make_Putnam_model_from(params): # from Putnam Chapter 3
                                 'a': 1.0,
                                 'b': 1.0,
                                 'loc': 0.0,
-                                'scale': 0.24}
+                                'scale': qf_scale}
                 },
             'bf1_weight':
                 {'func':'gamma',
                 'args': {
                         'a': a_bf,
-                    'scale': 'S_scale', #t_bf,
+                    'scale': t_bf, #'S_scale', #t_bf,
                       'loc': 0
-                    }}
+                    },
+                'nsegment': 200} #improves piece-wise linear approx in steep regions and eliminates spikes
             }, 
 #if >1 dict for 'quickflow (mm/hr)', then mesas looks for column named 'ORPB qf' and other dict key(s) -- >1 dict will allow for weighted SAS functions, these columns in df will be the weights [0,1]
         'ET (mm/hr)': 
@@ -278,9 +280,8 @@ def make_Putnam_model_from(params): # from Putnam Chapter 3
                                 'scale': et_scale}}
             }
     }
-    solute_parameters = {'precip 18O': {'C_old': -7.6, 'observations': 'ORPB 18O'}}
-    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=True)
-                  
+    solute_parameters = {'precip 18O': {'C_old': c18O_old, 'observations': 'ORPB 18O'}}#, 'mT_init': 'mT_spinup'}}
+    return Model(df, sas_specs=sas_specs, solute_parameters=solute_parameters, dt=1, influx='influx (mm/hr)', record_state=True, n_substeps=10)#, sT_init=sT_init) #n_substeps helps so mass doesn't leak to pq when storage and S_scale drop on full daily timestep (Claude)
 
 
 # calc error when quickflow is small  as determined by baseflow separation
@@ -305,7 +306,8 @@ def maximize_me(params):
     model = make_Putnam_model_from(params) #***edit which distribution to maximize***
     model.run()
     obs = model.data_df['ORPB 18O'][issample].to_numpy()
-    pred = (1-model.data_df['bf1_weight'][issample].to_numpy())*(model.data_df['precip 18O --> quickflow (mm/hr)'][issample].to_numpy()) + model.data_df['bf1_weight'][issample].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][issample].to_numpy())
+    # pred = (1-model.data_df['bf1_weight'][issample].to_numpy())*(model.data_df['precip 18O --> quickflow (mm/hr)'][issample].to_numpy()) + model.data_df['bf1_weight'][issample].to_numpy()*(model.data_df['precip 18O --> baseflow 1 (mm/hr)'][issample].to_numpy())
+    pred = model.data_df['precip 18O --> discharge (mm/hr)'][issample].to_numpy()
     evaluator = RegressionMetric(obs, pred)
     kge = evaluator.kling_gupta_efficiency()
     print(f'KGE = {kge} for params = {params}')
@@ -338,6 +340,7 @@ a = 1.26 #1.26399 #1.249941962 # laetest g-opt: 0.8293324, b-opt: 0.733789
 b = 0.9923319 #latest b-opt: 0.945078
 a_bf = 2.84 #1.26 #(df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2 # mean^2/std^2 = (df['baseflow 1 (mm/hr)'].mean())**2/(df['baseflow 1 (mm/hr)'].std())**2
 t_bf = 1100 #1.48 #1.36-2.23 normalized to storage (df['baseflow 1 (mm/hr)'].std())**2/df['baseflow 1 (mm/hr)'].mean() #variance/mean, or should be mean storage that contains baseflow
+qf_scale = 5 #5mm qf scale for whole time series
 # q_max = 1 #normalized to wetness
 # lamda = -109.184 #-115.0382 #-106.9838848
 # S_c = 51.5895 #49.9052 #50.67889314
@@ -386,15 +389,62 @@ lamda=1.22 #.5 #12.1017 # 10/(df['storage (mm)'].median()-S_c) #median of storag
 #%%
 #--------set params_init---------
 # params_init = c18O_old, a, lamda, S_c, et_scale #***edit for distribution type***
-params = a_bf, lamda, S_c, S_Tet # for Putnam model
+# params = qf_scale,a_bf, lamda, S_c, et_scale, c18O_old # for Putnam TV model
 # params = S_0, c18O_old #uniform model
 # params = S_0, c18O_old, a, b # for beta model
-# params=params_init
+# params = c18O_old, a, lamda, S_c, et_scale #for gamma model
+# params_init=params
 
+# params = [0.54, 2.99, 1.12, -2023.54, 50.24, -7.47] #TV Putnam
+params = [.51, 3, 1800, 52.5, -7.32] #TIV Putnam
+# params = [18.5,  1.34727167,  1.21713205, -2.00844022e+03,  4.88000000e+01, -7.6] #for full timeseries on Putnam model (from basinhopping)
 #consider normalizing parameters to obtain better convergence of optimization
 # Beta notes: a<1, b=1 young water prefernce, a=1,b<1 old water preference, a=b=1 uniform selection
 #Gamma params: s_0=5701.46684 [c18O_old, a, et_storage] RMSE=0.5620217558825428 for params = [-7.60000000e+00  9.09859331e-01  1.58150050e+03]
 #Kumaraswamy params: s_0=5701.46684 [c18O_old, a, b, et_storage] RMSE = = 0.5576700088867051 for params = [-7.600000e+00  9.098500e-01  9.923319e-01  1.581500e+03]
+
+#%%
+#--------------------spin-up on first year repeated 5 times-------------
+spinup = pd.concat([df.loc[pd.Timestamp('2014-01-01'): pd.Timestamp('2014-12-31')]]*5, ignore_index=True)
+newd = pd.date_range(end='2013-12-31 23:00:00', periods=len(spinup), freq=res)
+assert len(spinup)==len(newd), f'spinup has {len(spinup)} rows but new index has {len(newd)}'
+spinup.index=newd
+# mesas passes precip 18O straight to the solver; a single nan in C_J propagates
+# through mT for the rest of the run and makes every C_Q nan. Fill as in the cell above.
+spinup['precip 18O'] = spinup['precip 18O'].bfill().ffill()
+assert spinup['precip 18O'].isna().sum()==0, 'nans remain in spinup precip 18O'
+df=spinup.copy() #to not have to change Putnam model
+model = make_Putnam_model_from(params)
+model.run()
+
+#%%------------------Save sT_init and mT_init to csv-------------------
+sT_init = model.get_sT()[:,-1]
+mT_init = model.get_mT('precip 18O')[:,-1]
+sT_mT_df = pd.DataFrame({'sT_init': sT_init, 'mT_init': mT_init})
+sT_mT_df.to_csv(f'/Users/simon/Desktop/ORPB_resolution_datasets/sT_mT_init_{res}5yi.csv', index=False)
+
+#%% save previously saved sT_init and mT_init to length-dependent csv
+resolution='daily'
+res='D'
+sT_mT_df = pd.read_csv(f'/Users/simon/Desktop/ORPB_resolution_datasets/sT_mT_init_{res}5yi.csv')
+data_df = pd.read_csv(f"/Users/simon/Desktop/ORPB_resolution_datasets/ORPB_isotope_data_bfill_precip 18O_{resolution}.csv", index_col=0, parse_dates=[0])
+data_df = data_df.loc[pd.Timestamp('2015-01-01'): pd.Timestamp('2015-03-31 23:00:00')] #2014-08-01 - 2016-08-31subset to Putnam's data range
+
+#crops to match length data_df
+# if len(sT_mT_df)<len(data_df):
+#     mT_init = pd.concat([sT_mT_df['mT_init'], pd.Series(np.zeros(len(data_df)-len(sT_mT_df)))], ignore_index=True).values
+#     sT_init = pd.concat([sT_mT_df['sT_init'], pd.Series(np.zeros(len(data_df)-len(sT_mT_df)))], ignore_index=True).values
+# elif len(sT_mT_df)>=len(data_df):
+#     mT_init = sT_mT_df['mT_init'][:len(data_df)].values 
+#     sT_init = sT_mT_df['sT_init'][:len(data_df)].values
+#instead just crop to where mT becomes negligible...within first year
+mT_init = sT_mT_df['mT_init'][:150].values 
+sT_init = sT_mT_df['sT_init'][:150].values
+
+tag='D_std'
+sT_mT_df = pd.DataFrame({'sT_init': sT_init, 'mT_init': mT_init})
+sT_mT_df.to_csv(f'/Users/simon/Desktop/ORPB_resolution_datasets/sT_mT_init_{tag}.csv', index=False)
+
 
 
 
@@ -408,8 +458,8 @@ from scipy.optimize import fmin
 
 # Try basinhopping
 from scipy.optimize import basinhopping
-# params = basinhopping(maximize_me, params_init, niter=25, T=0.01)
-params = basinhopping(minimize_me, params_init, niter=25, T=0.01, stepsize=0.1)
+params = basinhopping(maximize_me, params_init, niter=25, T=0.01)
+# params = basinhopping(minimize_me, params_init, niter=25, T=0.01, stepsize=0.1)
 
 #%%
 # ------------------Try Monte Carlo sampling----------------------
@@ -427,7 +477,7 @@ R=normalized_storage.max()-normalized_storage.min()
 #     "et_scale": (5, 100)
 # }
 bounds = {# for gamma split model
-    "c18O_old": (-16.9, -0.445),
+    "c18O_old": (-16.9, -0.445), #(low, high) for uniform distribution
     "a_qf": (0.1, 1.0),      # quickflow: young water, shorter travel time
     "t_qf": (0.1, 1.0),      # quickflow: young water, shorter travel time
     "a_bf": (1.0, 5.0),      # baseflow: old water, longer travel time
@@ -472,6 +522,106 @@ cols = param_names + ['RMSE','NSE']
 results_df = pd.DataFrame(results, columns=cols)
 print(results_df.describe())
 
+#%%
+#-------Prior predictive check of prior params for Putnam model--------
+# MCMC on 200 rvs of prior param distributions
+
+from tqdm import tqdm
+from scores.continuous import nse
+import xarray as xr
+rng = np.random.default_rng(seed=42) # for reproducibility
+
+# priors = {# for Putnam model TV
+#     #(mean, std) for normal distribution
+#     "qf_scale": (0.51, 0.249),      # quickflow: young water, shorter travel time
+#     "a_bf": (3.0, 1.02),      # baseflow: old water, longer travel time
+#     "lamda": (1.005, 0.51),
+#     "S_c": (-2011.85, 270.79),
+#     "et_scale": (52.5, 24.23),
+#     "c18O_old": (-7.32, 0.58)
+# }
+priors = {# for Putnam model TIV
+    #(mean, std) for normal distribution
+    "qf_scale": (0.51, 0.249),      # quickflow: young water, shorter travel time
+    "a_bf": (3.0, 1.02),      # baseflow: old water, longer travel time
+    "t_bf": (1800, 200),
+    "et_scale": (52.5, 24.23),
+    "c18O_old": (-7.32, 0.58)
+}
+param_names = list(priors.keys())
+
+def sample_params(priors):
+    return [rng.normal(loc=mean, scale=std) for mean, std in priors.values()]
+
+def evaluate_model(params):
+    try:
+        model=make_Putnam_model_from(params)
+        model.run()
+
+        pq_samples.append(model.get_pQ('discharge (mm/hr)'))
+        output_samples.append(model.data_df['precip 18O --> discharge (mm/hr)'])
+        del model #free up memory
+        
+        param_samples.append(params)
+        return
+    except Exception as e: # catches unstable parameter combinations
+        print('Error in model evaluation: ', e)
+        return
+
+#compensate for fewer obs with more θ draws. If weekly data has ~50 obs vs daily's ~650, bump M_PRIOR and the posterior draw count (K_FWD
+M = 200 #samples
+pq_samples = []
+param_samples = []
+output_samples = []
+results = []
+for _ in tqdm(range(M)):
+    params = sample_params(priors)
+    # qf_scale, a_bf, lamda, S_c, et_scale, c18O_old = params #Putnam TV
+    qf_scale, a_bf, t_bf, et_scale, c18O_old = params #Putnam TIV
+    while qf_scale <=0 or a_bf <=0 or et_scale <=0 or t_bf <=0: #or lamda<=0: # ensure parameters that must be positive are positive
+        params = sample_params(priors)
+        # qf_scale, a_bf, lamda, S_c, et_scale, c18O_old = params #Putnam TV
+        qf_scale, a_bf, t_bf, et_scale, c18O_old = params #Putnam TIV
+    evaluate_model(params)
+    
+# Plot prior TTDs at a few representative times
+pq_stack = np.stack(pq_samples, axis=0)  # [M, age, time]
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, t_idx in zip(axes, [100, 200, 364]):
+    for m in range(200):
+        ax.plot(pq_stack[m, :, t_idx], alpha=0.15)#, color='C0')
+    # ax.set_yscale('log')
+    # ax.set_ylim(1e-5, 1e2)              # clip extreme spikes
+    ax.set_xlabel('Age (days)')
+    ax.set_ylabel('pQ (density)')
+    ax.set_title(f"Prior TTDs at t={t_idx}")
+
+PQ=[]
+for m in range(M):
+    cum = np.cumsum(pq_stack[m, :, :], axis=0)#*dt=1
+    PQ.append(cum)
+PQ_stack = np.stack(PQ, axis=0)
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, t_idx in zip(axes, [100, 200, 364]):
+    for m in range(M):
+        ax.plot(PQ_stack[m, :, t_idx], alpha=0.15)#, color='C0')
+    ax.set_title(f"Prior Cumulative TTDs at t={t_idx}")
+
+
+#%%
+# Save average pq across all M samples as csv
+avg_pq = np.mean(pq_stack, axis=0)  # [age, time]
+avg_pq_df = pd.DataFrame(avg_pq)  # columns are time steps
+avg_pq_df.to_csv(f'/Users/simon/Desktop/ORPB_resolution_datasets/avg_pq_{res}.csv', index=False)
+
+out = np.stack(output_samples, axis=0)
+r = []
+obs=df['ORPB 18O'][issample].to_numpy()
+for i in range(M):
+    r.append(obs-out[i,:][issample])
+r=np.stack(r, axis=0)
+residuals_df = pd.DataFrame(r)  # columns are time steps
+residuals_df.to_csv(f'/Users/simon/Desktop/ORPB_resolution_datasets/residuals_{res}.csv', index=False)
 
 #%%
 # load results_df from Rockfish
@@ -503,10 +653,13 @@ model.run()
 #%%
 # ------------------Build the model --------------------
 # Now build a model with parameters
+from pytictoc import TicToc
+t = TicToc()
+t.tic()
 from mesas.sas.model import Model
 model = make_Putnam_model_from(params) #***edit which distribution***
 model.run()
-
+t.toc()
 #%%------------------Save model to pickle-------------------
 import pickle
 pickle.dump(model, open('Putnam_model_n1.01.50.950.2.pkl', 'wb'))
@@ -559,6 +712,28 @@ plt.title('Isotope outflow at ORPB')
 # ax2.set_title('Isotope outflow at ORPB')
 
 #%%
+# check accuracy
+from permetrics.regression import RegressionMetric
+import hydroeval as he
+# obs = df['ORPB 18O'].bfill()[st:et].to_numpy()
+obs = df['ORPB 18O'][issample].to_numpy()#for comparing with Rockfish imported results have to set df to same length and use that to compare
+pred = model.data_df['precip 18O --> discharge (mm/hr)'][issample].to_numpy() #for Rockfish runs
+nse = he.evaluator(he.nse, pred, obs)
+print(f'NSE = {nse[0]}')
+RMSE = np.sqrt(np.mean((pred-obs)**2))
+print(f'RMSE = {RMSE}')
+
+#%% # check model choice
+# Metrics calculation
+n = len(obs)
+rss = np.sum((obs - pred) ** 2)
+k = len(params) + 1  # Number of predictors + intercept + error variance term
+
+# Manual AIC formula
+aic = n * np.log(rss / n) + 2 * k
+print(f"Manual AIC: {aic}")
+
+#%%
 # Plot TTD
 import matplotlib.cm as cm
 cmap = plt.get_cmap('viridis')
@@ -572,15 +747,15 @@ for i in range(0, len(df)):
     ax[0].plot(T, PQ[:,i], color=colors[i])
     ax[1].plot(T, pq[:,i], color=colors[i])
 
-ax[0].set_ylim([0, 1])
+ax[0].set_ylim([0, 1.1])
 ax[0].set_xlim(xmin=0)
 ax[0].axhline(1, color='0.1', lw=0.8, ls=':')
 ax[0].axhline(0, color='0.1', lw=0.8, ls=':')
-ax[0].set_xlabel('Age (days)')
+ax[0].set_xlabel(f'Age ({res})')
 ax[0].set_ylabel('$P_Q$')
 ax[0].set_title('Cumulative TTD')
 ax[1].set_xlim([0,25])
-ax[1].set_xlabel('Age (days)')
+ax[1].set_xlabel(f'Age ({res})')
 ax[1].set_ylabel('$p_Q$')
 ax[1].set_title('TTD')
 sm = cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0,
