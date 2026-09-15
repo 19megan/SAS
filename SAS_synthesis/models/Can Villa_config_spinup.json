@@ -1,0 +1,44 @@
+{
+    "sas_specs":{
+
+        "Q [mm/h]":{
+            "Q SAS function":{
+                "func": "kumaraswamy",
+                "args": {
+                    "loc": 0.0,
+                    "scale": "S",
+                    "a": "k",
+                    "b": 1.0
+                }
+            }
+        },
+
+        "ET [mm/h]":{
+            "ET SAS function":{
+                "func": "kumaraswamy",
+                "args": {
+                    "loc": 0.0,
+                    "scale": "S",
+                    "a": 3.26,
+                    "b": 1.0
+                }
+            }
+        }
+    },
+
+
+    "solute_parameters":{
+
+        "Cin [-]":{
+            "C_old": -7.7,
+            "observations": "measC_Q [-]"
+        }
+    },
+
+
+    "options":{
+        "verbose": false,
+        "n_substeps": 1,
+        "record_state": true
+    }
+}

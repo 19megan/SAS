@@ -1,0 +1,59 @@
+{
+    "sas_specs":{
+
+        "Q [m3/4h]":{
+            "lamda1":{
+                "func": "kumaraswamy",
+                "args": {
+                    "loc": 0.0,
+                    "scale": 4.1,
+                    "a": 1.0,
+                    "b": 1.0
+                }
+            },
+            "lamda2":{
+                "func": "gamma",
+                "args": {
+                    "a": 16.9117647058824,
+                    "scale": 34,
+                    "loc": 0 
+                }
+            },
+            "lamda3":{
+                "func": "gamma",
+                "args": {
+                    "a": 11.7241379310345,
+                    "scale": 87,
+                    "loc": 0 
+                }
+            }
+        },
+
+        "ET [m3/4h]":{
+            "ET SAS function":{
+                "func": "gamma",
+                "args": {
+                    "loc": 0.0,
+                    "scale": 77,
+                    "a": 3.96103896103896
+                }
+            }
+        }
+    },
+
+
+    "solute_parameters":{
+
+        "d2H (permil)":{
+            "C_old": -50.6,
+            "observations": "Q d2H (permil)"
+        }
+    },
+
+
+    "options":{
+        "verbose": false,
+        "n_substeps": 1,
+        "record_state": true
+    }
+}

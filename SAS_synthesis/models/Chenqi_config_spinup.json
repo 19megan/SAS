@@ -1,0 +1,45 @@
+{
+    "sas_specs":{
+
+        "Q (mm/day)":{
+            "Q SAS function":{
+                "func": "kumaraswamy",
+                "args": {
+                    "loc": 0.0,
+                    "scale": "S",
+                    "a": "k",
+                    "b": 1.0
+                }
+            }
+        },
+
+        "ET (mm/day)":{
+            "ET SAS function":{
+                "func": "kumaraswamy",
+                "args": {
+                    "loc": 0.0,
+                    "scale": "S",
+                    "a": 0.42,
+                    "b": 1.0
+                }
+            }
+        }
+    },
+
+
+    "solute_parameters":{
+
+        "rain-D (‰)":{
+            "C_old": -60.4,
+            "observations": "outlet-D (‰)",
+            "alpha": {"Q (mm/day)":1, "ET (mm/day)":0.995}
+        }
+    },
+
+
+    "options":{
+        "verbose": false,
+        "n_substeps": 1,
+        "record_state": true
+    }
+}

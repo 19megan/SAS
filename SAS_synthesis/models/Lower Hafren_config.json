@@ -1,0 +1,38 @@
+{
+    "sas_specs":{
+
+        "Q":{
+            "Q SAS function":{
+                "func": "gamma",
+                "args": {
+                    "loc": 0.0,
+                    "scale": "S_scale",
+                    "a": 0.6856
+                }
+            }
+        },
+
+        "ET":{
+            "ET SAS function":{
+                "ST": [0.0, 398.0]
+            }
+        }
+    },
+
+
+    "solute_parameters":{
+
+        "Cl mg/l":{
+            "C_old": 7.11,
+            "alpha": {"Q": 1.0, "ET": 0.0},
+            "observations": "Q Cl mg/l"
+        }
+    },
+
+
+    "options":{
+        "verbose": false,
+        "n_substeps": 1,
+        "record_state": true
+    }
+}
