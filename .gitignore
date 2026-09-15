@@ -5,6 +5,7 @@ __pycache__/
 *.so
 *.pkl
 .vscode/
+__init__.py
 
 # Jupyter
 .ipynb_checkpoints/
@@ -28,3 +29,5 @@ papers/
 NN_experiments/
 olin_hall_precip.csv
 results_df.csv
+SAS_synthesis_DEMS/
+SAS_synthesis_twi_drainagedensity/
