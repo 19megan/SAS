@@ -21,7 +21,7 @@ data['cumP'] = data['rainfall (mm/hr)'].cumsum()
 #%%
 #------------if agg_res='D', we want data to be daily resolution---------------
 data = data.resample('D').agg({'rainfall (mm/hr)':'sum', 'snowfall SWE (mm/hr)':'sum', 'snowmelt (mm/hr)':'sum', 
-                               'discharge (mm/hr)':'sum', 'storage (mm)':'sum', 'ET (mm/hr)':'sum', 'baseflow 1 (mm/hr)':'sum',
+                               'discharge (mm/hr)':'sum', 'storage (mm)':'last', 'ET (mm/hr)':'sum', 'baseflow 1 (mm/hr)':'sum',
                                  'baseflow 2 (mm/hr)':'sum', 'Sample Name': 'last', 'precip 2H': 'mean', 'precip 2H StDev':'mean', 
                                  'precip 18O':'mean', 'precip 18O StDev':'mean', 'precip 17O':'mean', 'precip 17O StDev':'mean', 
                                  'ORPB 2H':'mean', 'ORPB 2H StDev':'mean', 'ORPB 18O':'mean', 'ORPB 18O StDev':'mean', 'ORPB 17O':'mean',
@@ -169,8 +169,7 @@ df = pd.concat([precip, c_iso],axis=1).loc[c_iso.index]
 df['weekly_obs'] = ~df.loc[df['rainfall (mm/hr)']>0, 'Sample Name'].duplicated(keep='last') # make sure weekly values are only for when rain was actually observed (1066 obs values vs only 235 when observed without rain restriction)
 df.loc[df['weekly_obs'].isna(), 'weekly_obs'] = False #set non-masked values to False i.e. where no rain observed
 df.loc[df['weekly_obs']==False, iso] = np.nan # set non-weekly observed isotope values to nan so they don't influence GP fit
-df.bfill(inplace=True)
-df.ffill(inplace=True) #to get last 23 rows of data that have zero rainfall
+# no bfilling or ffilling to maintain which samples are observed.
 df['cumP'] = df['rainfall (mm/hr)'].cumsum()
 df['cumP'] = df['cumP'].apply(lambda x: round(x/2.54e-3)*2.54e-3)
 
@@ -183,20 +182,18 @@ resampled = data.copy()
 resampled['is_weekly'] = df['weekly_obs'] #makes mask match coarse data
 resampled.loc[resampled['is_weekly'].isna(), 'is_weekly'] = False
 resampled[iso] = iso_n[iso]
-resampled.bfill(inplace=True)
-resampled.ffill(inplace=True)
+# no bfilling or ffilling to maintain which samples are observed.
 t_agg = resampled.index.dayofyear
 
 #note: after checking data[iso] and resampled[iso], they are very different post 2019-06-10 because there is no rain, but data[iso] still somehow has observations.
 
 #%%
-# after this point, created backfilled interpolation, otherwise skip to trend removal for GP interpolation
+# after this point, create mean_c col and save to csv, otherwise skip to trend removal for GP interpolation
 # resampled['mean_c'] = resampled[iso]
 # data = data.join(resampled['mean_c'])
-# data['mean_c'] = data['mean_c'].bfill().ffill()
 # resolution='weekly' # == c_res to indicate the resolution of the coarse iso
 # resolution_dataset_root = '/Users/simon/Desktop/ORPB_resolution_datasets'
-# data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_bfill_{iso}_{resolution}.csv")
+# data.to_csv(f"{resolution_dataset_root}/ORPB_isotope_data_{iso}_{resolution}.csv")
 
 #%%
 #----CHOOSE METHOD FOR TREND REMOVAL: Method I: isoMAP based trend, Method II: sinusoidal trend
