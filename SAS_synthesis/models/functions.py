@@ -4,10 +4,127 @@
 import pandas as pd
 import numpy as np
 from mesas.sas.model import Model
-from SAS_synthesis.models.SAS_models import make_SAS_model
+from SAS_synthesis.models.SAS_models import make_SAS_model, weierbach_hydrology, WEIERBACH_PARAMS
 from tqdm import tqdm
 from scores.continuous import nse
 import xarray as xr
+
+
+def _bb_storage(P, PET, Q, tol=1e-8, max_iter=50):
+    """
+    Bruntland Burn relative storage, following Benettin et al. (2017) section 3.2:
+    dS(t)/dt = P(t) - lf(t)*PET(t) - Q(t), with lf(t) = min{1, S(t)/(2*std(S))}.
+
+    lf depends on S and on std(S) over the whole record, so the balance is stepped forward with
+    std(S) held fixed and std(S) is then updated, until it converges. The returned S is offset so
+    its minimum is zero (lf must stay in [0,1], which fixes the otherwise free datum).
+
+    Parameters:
+    P, PET, Q (np.ndarray): influx, potential ET and discharge, same units per timestep.
+
+    Returns:
+    S (np.ndarray): relative storage, minimum 0.
+    ET (np.ndarray): actual evapotranspiration, lf*PET.
+    """
+    n = len(P)
+    sd = np.std(np.cumsum(P - PET - Q)) # first guess, lf = 1 throughout
+    for _ in range(max_iter):
+        S = np.empty(n)
+        ET = np.empty(n)
+        S[0] = 0.0
+        for i in range(n):
+            lf = min(1.0, max(0.0, S[i]/(2*sd)))
+            ET[i] = lf*PET[i]
+            if i+1 < n:
+                S[i+1] = S[i] + P[i] - ET[i] - Q[i]
+        S = S - S.min()
+        sd_new = np.std(S)
+        if abs(sd_new-sd) < tol:
+            break
+        sd = sd_new
+    return S, ET
+
+
+def _weierbach_data(data_file_path):
+    """
+    Weierbach input data at the 4 h model timestep, following Rodriguez and Klaus (2019) section 2.5
+    and Rodriguez et al. (2021) section 2.2.
+
+    Returns:
+    df (pd.DataFrame): October 2010 - October 2017. 'main' marks the period of interest
+        (October 2015 - October 2017), 'record' the daily steps of it that the model records.
+    spinup (pd.DataFrame): the October 2010 - October 2015 cycle looped back twice before 2010.
+    """
+    start, main_start, end = pd.Timestamp('2010-10-01'), pd.Timestamp('2015-10-01'), pd.Timestamp('2017-09-30 20:00')
+    area = 0.42e6 # m2, the 42 ha catchment above the SW1 weir
+    grid = pd.date_range(start, end, freq='4h')
+
+    def read_15min(file, col):
+        s = pd.read_excel(f'{data_file_path}/{file}', index_col=0, parse_dates=[0], header=3)[col]
+        return pd.to_numeric(s, errors='coerce') # 'no data' -> NaN
+
+    # precipitation (mm): 15 min tipping bucket, 10 min from 2016. Depths, so they sum to 4 h
+    # directly. The few 'no data' stamps count as 0.
+    P = read_15min('Weierbach_rainfall_Holtz_2009-2019.xlsx', 'rainfall (mm)')
+    J = P[start:end+pd.Timedelta('4h')].resample('4h').sum().reindex(grid)
+
+    # discharge at SW1 (m3/s, 15 min) -> mm per 15 min over the catchment area -> mm/4h.
+    # Two gaps: 38 days in 2012 (spin-up cycle) and 2017-01-01 - 2017-01-30 (main period; none of
+    # the four gauges cover it). Interpolated linearly in time so they are not summed as zero flow.
+    Q = read_15min('Weierbach_stream discharge_2009-2019.xlsx', 'Q (m3/s)')
+    Q = Q[start-pd.Timedelta('30D'):end+pd.Timedelta('30D')]
+    gap = Q.isna().resample('4h').max().reindex(grid)
+    Q = Q.interpolate('time', limit_area='inside')
+    Q = (Q*900/area*1000)[start:end+pd.Timedelta('4h')].resample('4h').sum().reindex(grid)
+
+    # potential ET: FAO Penman-Monteith reference ET0 at 15 min in mm/h (Glaser et al., 2016),
+    # stamped with MATLAB datenums (days since year 0; 719529 = 1970-01-01). The datenums are
+    # stored to 4 decimals (~9 s), so round to the 15 min grid. mm/h * 0.25 h = mm per 15 min.
+    et0 = pd.read_table(f'{data_file_path}/ET0_15min_mmh_oct10-jan18_Weierbach.txt', header=None, names=['datenum', 'ET0 [mm/h]'])
+    et0.index = pd.to_datetime(et0['datenum']-719529, unit='D').dt.round('15min')
+    PET = (et0['ET0 [mm/h]']*0.25)[start:end+pd.Timedelta('4h')].resample('4h').sum().reindex(grid)
+
+    df = pd.DataFrame({'J [mm/4h]': J, 'Q [mm/4h]': Q, 'PET [mm/4h]': PET, 'Q gapfilled': gap}, index=grid)
+
+    # d2H in precipitation: bulk samples dated at collection. "The time series of tracer in
+    # precipitation was interpolated between two consecutive samples (e.g., A and B) as being equal
+    # to the value of the next sample (i.e., B)" -> backfill. NB the papers also inserted the
+    # sequential rainfall samples (~23 h) for 2015-2017; those are not in this file.
+    iso_p = pd.read_excel(f'{data_file_path}/Weierbach_OH_rainfall_2009-2019.xlsx', header=3)
+    iso_p = pd.Series(pd.to_numeric(iso_p['d2H (permil)'], errors='coerce').values,
+                      index=pd.to_datetime(iso_p['sampling_date'])).dropna()
+    df['Cin d2H'] = iso_p.reindex(grid.union(iso_p.index)).bfill().reindex(grid)
+
+    # d2H in the stream: grab samples at SW1 (dates only, placed at 00:00 of the sampling day)
+    iso_q = pd.read_excel(f'{data_file_path}/Weierbach_OH_streamwater_2009-2019.xlsx')
+    iso_q = iso_q[(iso_q['sample_type']=='streamwater') & (iso_q['sampling_location']=='SW1')]
+    iso_q = pd.Series(pd.to_numeric(iso_q['d2H (permil)'], errors='coerce').values,
+                      index=pd.to_datetime(iso_q.iloc[:, 2])).dropna()
+    df['measC_Q d2H'] = iso_q.groupby(level=0).mean().reindex(grid)
+
+    # tritium in the stream (Rodriguez et al., 2021 used 24 of these), placed in their 4 h step
+    iso_3H = pd.read_excel(f'{data_file_path}/Weierbach_tritium_2011-2017.xlsx', header=3)
+    iso_3H = pd.Series(iso_3H['3H (TU)'].values, index=pd.to_datetime(iso_3H['sampling_date']).dt.floor('4h'))
+    df['measC_Q 3H'] = iso_3H.groupby(level=0).mean().reindex(grid)
+
+    df['main'] = df.index >= main_start
+    # record the state once a day (last step of the day) over the main period only; the recorded
+    # arrays are (max_age x recorded steps), so this keeps them ~100 MB instead of ~2 GB
+    df['record'] = df['main'] & (df.index.hour == 20)
+
+    # "The input data we used for the spin-up corresponds to the input data from October 2010 to
+    # October 2015 that we looped back over periods of 5 years." The water balance (S, ET) is run
+    # over the papers' full 100 years in weierbach_hydrology. The transport spin-up only has to be
+    # longer than the main run's age window (7 years): water younger than T depends only on the
+    # last T of forcing when the SAS functions are functions of ST.
+    n_loops = 2
+    spinup = pd.concat([df.loc[~df['main']]]*n_loops, ignore_index=True)
+    spinup.index = pd.date_range(end=start-pd.Timedelta('4h'), periods=len(spinup), freq='4h')
+    spinup['main'] = False
+    spinup['record'] = False
+
+    return df, spinup
+
 
 def load_data(location, data_file_path):
     """
@@ -43,8 +160,68 @@ def load_data(location, data_file_path):
         return df_harman, df_harman, df_harman, issample, influx, et, discharge, iso_out, iso_in, age_unit
 
     elif location == 'Bruntland Burn':
+        # Benettin et al. (2017), WRR 53, doi:10.1002/2016WR020117. Model run at hourly timesteps
+        # (the paper's marginal TTD averages "more than 26,000" curves = the 26,280 hourly steps
+        # of 2011-06-01 to 2014-05-31).
+        # NB the compiled csv columns are named *_mmd but hold PER-HOUR depths: daily sums of
+        # etpot_mmd reproduce 'ETP (mm d-1)' in the daily xlsx to 3 decimals. Do not divide by 24.
+        df_benettin = pd.read_csv(f'{data_file_path}/BruntlandBurn_data_compiled_2011-2014.csv',
+                                  index_col=0, parse_dates=[0], date_format='%d-%b-%Y %H:%M:%S') #hourly 2011-06-02 - 2014-09-30
+        df_benettin.columns = ['J [mm/h]', 'Q [mm/h]', 'PET [mm/h]'] # P, Q, PET from Soulsby et al. (2015)
 
-        return np.nan
+        influx = 'J [mm/h]'
+        pet = 'PET [mm/h]'
+        et = 'ET [mm/h]'
+        discharge = 'Q [mm/h]'
+        iso_out = 'measC_Q d2H'
+        iso_in = 'Cin d2H'
+        age_unit = 'hour'
+
+        # patch the 204 missing discharge hours (4 gaps, the longest 196 h over 2012-05-30 - 2012-06-07)
+        # with the daily record, which is gap-free over the same period
+        daily = pd.read_excel(f'{data_file_path}/BruntlandBurn_ORIGINAL_BBdaily-all_2011_2014.xlsx', index_col=0, parse_dates=[0])
+        Q_from_daily = (daily['BB_Q (mm/d)']/24).reindex(df_benettin.index, method='ffill')
+        gap = df_benettin[discharge].isna()
+        df_benettin.loc[gap, discharge] = Q_from_daily[gap]
+
+        # measured deuterium. Use the EcH2Oiso workbook, not the P_d2Hmodel/Q_d2H columns of the daily
+        # xlsx: this sheet reproduces the flow-weighted mean precip d2H (-59.55) and mean stream d2H
+        # (-57.55) the paper reports (-59.8 and -57.4), the daily xlsx columns are a modelled variant.
+        iso = pd.read_excel(f'{data_file_path}/BruntlandBurn_Isotopes_usedfor_EcH2Oiso.xlsx', sheet_name='Precip-Stream', header=[0,1])
+        iso.columns = ['date', 'P d2H', 'P d18O', 'Q d2H', 'Q d18O'] # two-row header: (Precip|Stream) x (dD|d18O)
+        iso = iso.set_index(pd.to_datetime(iso.pop('date'))) #daily 2011-06-01 - 2016-09-19
+
+        day = df_benettin.index.normalize()
+        # precipitation samples are cumulative over 24 h -> the daily value applies to all 24 hours
+        # (every rainy hour in the record gets a value, so no filling is needed)
+        df_benettin[iso_in] = iso['P d2H'].reindex(day).to_numpy()
+        # stream samples are instantaneous grabs at 9 A.M. -> only the 09:00 hour is an observation.
+        # Broadcasting these over the day instead would inflate the sample count 24x and make the
+        # NSE incomparable with the other catchments.
+        df_benettin[iso_out] = np.where(df_benettin.index.hour==9, iso['Q d2H'].reindex(day).to_numpy(), np.nan)
+
+        # relative storage from the water balance dS/dt = P - lf*PET - Q, with the PET limiting
+        # factor lf = min(1, S/(2*std(S))). S appears on both sides, so step the balance forward and
+        # iterate on std(S) until it stops moving; S is then offset so its minimum is zero.
+        df_benettin['S_rel'], df_benettin[et] = _bb_storage(df_benettin[influx].to_numpy(),
+                                                            df_benettin[pet].to_numpy(),
+                                                            df_benettin[discharge].to_numpy())
+        # check from the paper: "storage variations computed with this simplified methodology show no
+        # trend in the observed 3 year period" -> 13.7 mm/yr drift across a 246 mm range. ET/PET = 0.68
+
+        # spin-up: 8 years repeating the hydrologic data of the first year of measurements
+        n_loops = 8
+        spinup = pd.concat([df_benettin.loc['2011-06-01':'2012-05-31']]*n_loops, ignore_index=True)
+        spinup.index = pd.date_range(end='2011-06-01 23:00:00', periods=len(spinup), freq='h')
+
+        # calibration period: 1 June 2011 to 1 June 2014 (1095 days). The record runs 4 months longer
+        # (to 2014-09-30) and the isotopes to 2016, so there is spare data if you want to extend it.
+        df_benettin_val = df_benettin.loc[pd.Timestamp('2014-06-01'):]
+        df_benettin = df_benettin.loc[pd.Timestamp('2011-06-01'):pd.Timestamp('2014-05-31 23:00:00')]
+        issample = (df_benettin[iso_out].notna()) & (df_benettin[discharge]>0) #992 stream samples
+
+        return df_benettin, spinup, df_benettin_val, issample, influx, et, discharge, iso_out, iso_in, age_unit
+
 
 
     elif location == 'Providence Creek':
@@ -52,127 +229,34 @@ def load_data(location, data_file_path):
         return np.nan
     
 
-    elif location == 'Weierbach (2019)':
-        df_r = pd.read_excel(f'{data_file_path}/Weierbach_rainfall_Holtz_2009-2019.xlsx', index_col=0, parse_dates=[0], header=3) #start: 2009-01-01
-        df_r['rainfall (mm)'] = df_r['rainfall (mm)'].apply(pd.to_numeric, errors = 'coerce')
-        df_r = df_r.resample('4h').sum() # model run at 4h timestep
-        stream = pd.read_excel(f'{data_file_path}/Weierbach_stream discharge_2009-2019.xlsx', index_col=0, parse_dates=[0], header=3) #start: 2009-09-01
-        stream['Q (m3/s)'] = stream['Q (m3/s)'].apply(pd.to_numeric, errors = 'coerce')
-        stream['Q (m3/4h)'] = stream['Q (m3/s)']*60*15 # convert to m3/15min
-        stream = stream.resample('4h').sum()
-        df_r = df_r.join(stream[['Q (m3/4h)']])
-        iso_p = pd.read_excel(f'{data_file_path}/Weierbach_OH_rainfall_2009-2019.xlsx', index_col=3, parse_dates=[3], header=3) #fortnightly start: 2009-12-04
-        df_r = df_r.join(iso_p[['d18O (permil)', 'd2H (permil)']])
-        iso_q = pd.read_excel(f'{data_file_path}/Weierbach_OH_streamwater_2009-2019.xlsx', index_col=2, parse_dates=[2]) # start: 2009-09-21
-        iso_q = iso_q[(iso_q['sample_type']=='streamwater') & (iso_q['sampling_location']=='SW1')]
-        iso_q[['Q d18O (permil)', 'Q d2H (permil)']] = iso_q[['d18O (permil)', 'd2H (permil)']]
-        df_r = df_r.join(iso_q[['Q d18O (permil)', 'Q d2H (permil)']])
-
-        # start where first isotope precip samples start (2009-12-04)
-        df_r = df_r.loc[pd.Timestamp('2009-12-04'):]
-
-        influx = 'rainfall (mm)'
-        pet = 'PET'
-        discharge = 'Q (m3/4h)'
-        iso_out = 'Q d2H (permil)'
-        iso_in = 'd2H (permil)'
+    elif location in ('Weierbach (2019)', 'Weierbach (2021)'):
+        # Rodriguez and Klaus (2019), WRR 55, doi:10.1029/2019WR024973, and Rodriguez et al. (2021),
+        # HESS 25, doi:10.5194/hess-25-401-2021. Same data, timestep (4 h), periods and ET/storage
+        # model; they differ in Sref (calibrated in 2019, fixed at 2000 mm in 2021) and in the
+        # calibration (2021 adds tritium), which is handled in make_SAS_model.
+        df_w, spinup = _weierbach_data(data_file_path)
+        influx = 'J [mm/4h]'
+        et = 'ET [mm/4h]'
+        discharge = 'Q [mm/4h]'
+        iso_out = 'measC_Q d2H'
+        iso_in = 'Cin d2H'
         age_unit = '4h'
 
-        df_r[iso_in] = df_r[iso_in].bfill().ffill()
-        
-        Sref = 2426 #mm
-        Sroot=Sref-150 #total storage threshold
-        n=20
-        #*****************need to fix and get PET data
-        df_r['ET'] = 0
-        df_r['S'].iloc[0] = Sref
-        for i in range(len(df_r)-1):
-            df_r['ET'].iloc[i] = df_r[pet].iloc[i]*np.tanh((df_r['S'].iloc[i]/Sroot)**n)
-            df_r['S'].iloc[i+1] = df_r[influx].iloc[i]-df_r['ET'].iloc[i]-df_r[discharge].iloc[i]+Sref
-        df_r['ET'].iloc[len(df_r)] = df_r[pet].iloc[len(df_r)]*np.tanh((df_r['S'].iloc[len(df_r)]/Sroot)**n)
-        # ET = df_r[pet]*np.tanh((df_r['S']/Sroot)**n)
+        # S, ET and the composite SAS weights for the default (paper) parameters. make_SAS_model
+        # recomputes them when the parameters are sampled (ET depends on Sref through Sroot).
+        p = WEIERBACH_PARAMS[location]
+        weierbach_hydrology(spinup, df_w, p['Sref'], p['Sth'], p['dSth'], p['f0'], p['lamda1s'], p['lamda2'])
 
-        # model params
-        lamda1s = 0.11
-        f0 = 0.1
-        Smin = df_r['S'].min()
-        Sth = 105
-        dSth = 3.97 #storage variation threshold for flashy events
-        m = 1000 #fixed for threshold behavior
-        df_r['f'] = f0*(1-np.tanh((df_r['S']/(Smin+Sth))**m))
-        df_r['dS'] = df_r[influx] - df_r[discharge] - df_r[et]
-        df_r['dSbar'] = 0
-        for i in range(len(df_r)):
-            df_r['dSbar'].iloc[i] = np.max(1/3*np.sum([df_r['dS'].iloc[i], df_r['dS'].iloc[i-1], df_r['dS'].iloc[i-2]]), 0)
-        df_r['g'] = 1-np.exp(-df_r['dSbar']/dSth)
-        df_r['lamda1'] = lamda1s * (df_r['f']+(1-df_r['f'])*df_r['g'])
-        df_r['lamda2'] = 0.32 #constant
-        df_r['lamda3'] = np.ones(len(df_r))-df_r['lamda2']-df_r['lamda1']
+        # performance is evaluated over October 2015 - October 2017 only. df_w also carries the
+        # October 2010 - October 2015 cycle in front of it so the main run can track water up to
+        # 7 years old (mesas caps max_age at the run length; older water gets C_old).
+        issample = df_w['main'] & df_w[iso_out].notna() & (df_w[discharge]>0)
 
-        # "The input data we used for the spin-up corresponds to the input data from October 2010 to October 2015 that we looped back over periods of 5 years."
-        spinup = pd.concat([df_r.loc[pd.Timestamp('2010-10-01'): pd.Timestamp('2015-09-31 20:00:00')]]*2, ignore_index=True) #should be 100 yr spinup, but too much memory here
-        newd = pd.date_range(start='2005-10-01', end='2015-09-31', freq='4h')
-        spinup.index=newd
+        return df_w, spinup, df_w, issample, influx, et, discharge, iso_out, iso_in, age_unit
 
-        df_r = df_r.loc[pd.Timestamp('2015-10-01'):pd.Timestamp('2017-09-31 20:00:00')]
-        issample = df_r['Q d2H (permil)'].notna()
-
-        return df_r, spinup, df_r, issample, influx, pet, discharge, iso_out, iso_in, age_unit
-    
     elif location == 'Corin':
 
         return np.nan
-
-
-    elif location == 'Weierbach (2021)':
-        df_br = pd.read_excel(f'{data_file_path}/Weierbach_rainfall_Holtz_2009-2019.xlsx', index_col=0, parse_dates=[0], header=3) #start: 2009-01-01
-        df_br['rainfall (mm)'] = df_br['rainfall (mm)'].apply(pd.to_numeric, errors = 'coerce')
-        df_br = df_br.resample('4h').sum() # model run at 4h timestep
-        stream = pd.read_excel(f'{data_file_path}/Weierbach_stream discharge_2009-2019.xlsx', index_col=0, parse_dates=[0], header=3) #start: 2009-09-01
-        stream['Q (m3/s)'] = stream['Q (m3/s)'].apply(pd.to_numeric, errors = 'coerce')
-        stream['Q (m3/4h)'] = stream['Q (m3/s)']*60*15 # convert to m3/15min
-        stream = stream.resample('4h').sum()
-        df_br = df_br.join(stream[['Q (m3/4h)']])
-        iso_p = pd.read_excel(f'{data_file_path}/Weierbach_OH_rainfall_2009-2019.xlsx', index_col=3, parse_dates=[3], header=3) #fortnightly start: 2009-12-04
-        df_br = df_br.join(iso_p[['d18O (permil)', 'd2H (permil)']])
-        iso_q = pd.read_excel(f'{data_file_path}/Weierbach_OH_streamwater_2009-2019.xlsx', index_col=2, parse_dates=[2]) # start: 2009-09-21
-        iso_q = iso_q[(iso_q['sample_type']=='streamwater') & (iso_q['sampling_location']=='SW1')]
-        iso_q[['Q d18O (permil)', 'Q d2H (permil)']] = iso_q[['d18O (permil)', 'd2H (permil)']]
-        df_br = df_br.join(iso_q[['Q d18O (permil)', 'Q d2H (permil)']])
-        iso_q3H = pd.read_excel(f'{data_file_path}/Weierbach_tritium_2011-2017.xlsx', index_col=3, parse_dates=[3], header=3)
-        iso_q3H.index = iso_q3H.index.normalize() # normalize to 00:00:00 # only 27 samples start: 2011-06-10
-        iso_q3H['Q 3H (TU)'] = iso_q3H['3H (TU)']
-        df_br = df_br.join(iso_q3H[['Q 3H (TU)']])
-
-        # start where first isotope precip samples start (2009-12-04)
-        df_br = df_br.loc[pd.Timestamp('2009-12-04'):]
-        issample = df_br['Q d2H (permil)'].notna()
-        spinup = df_br.loc[pd.Timestamp('2009-12-04'): pd.Timestamp('2015-09-31 20:00:00')]
-        
-        influx = 'rainfall (mm)'
-        pet = 'PET'
-        discharge = 'Q (m3/4h)'
-        iso_out = 'Q d2H (permil)'
-        iso_in = 'd2H (permil)'
-        age_unit = '4h'
-
-        df_br[iso_in] = df_br[iso_in].bfill().ffill()
-
-
-        Sref = 2000 #mm
-        Sroot=Sref-150 #total storage threshold
-        n=20
-        #*****************need to fix and get PET data
-        df_br['S'] = df_br[influx]-df_br[et]-df_br[discharge]+Sref
-        ET = df_br[pet]*np.tanh((df_br['S']/Sroot)**n)
-        w = (df_br['S']-df_br['S'].min())/(df_br['S'].max()-df_br['S'].min())
-        df_br['k'] = k1+(1-w)*(k2-k1)
-        # add spin-up years 2008-2012
-        spinup = pd.concat([df_benettin.loc['2013-02-04':'2015-05-12']]*2, ignore_index=True)
-        newd = pd.date_range(start='2008-07-24', end='2013-02-03', freq='D')
-        spinup.index=newd
-
-        return df_br, spinup, df_br, issample, influx, pet, discharge, iso_out, iso_in, age_unit
 
 
     elif location == 'Chenqi':
@@ -310,6 +394,11 @@ def load_data(location, data_file_path):
         df_borriero = pd.read_table(f'{data_file_path}/Selke_hydroclim_data.txt', index_col=0, parse_dates=[0]) #daily
         iso_p = pd.read_table(f'{data_file_path}/Selke_d18O_P_raw.txt', index_col=0, parse_dates=[0]) #monthly
         iso_q = pd.read_table(f'{data_file_path}/Selke_d18O_Q.txt', index_col=0, parse_dates=[0]) #monthly
+        # typo in the source file: one sample is dated 2015-12-04, which sits in the December slot of
+        # an otherwise strictly monthly sequence (2014-11-06 -> 2015-01-14) but falls 7 months past
+        # the end of the hydroclimatic record, so the join below would silently drop it and calibrate
+        # on 26 of the 27 samples. Corrected here rather than in the data file.
+        iso_q = iso_q.rename(index={pd.Timestamp('2015-12-04'): pd.Timestamp('2014-12-04')}).sort_index()
         df_borriero = df_borriero.join(iso_p[['d18O_P raw']])
         df_borriero = df_borriero.join(iso_q[['d18O_Q']])
         issample = df_borriero['d18O_Q'].notna()
@@ -321,17 +410,28 @@ def load_data(location, data_file_path):
         age_unit = 'day'
 
         #monthly interpolation to daily with step
-        df_borriero[iso_in] = df_borriero[iso_in].bfill().ffill()
+        df_borriero[iso_in] = df_borriero[iso_in].ffill().bfill()
+        # storage variations, paper equation 1: S(t) = S0 + V(t). V is a running sum of the fluxes,
+        # not the per-timestep difference (which spans only -5.8 to 36.8 mm against -149.2 to
+        # 24.2 mm accumulated, and would give PLTV an essentially unrelated wetness series).
+        df_borriero['V'] = (df_borriero[influx]-df_borriero[et]-df_borriero[discharge]).cumsum()
+
+        # fallback parameters, used when the model is built without the Monte Carlo search
         S0 = 1778
         k1 = 0.675
         k2 = 1.165
-        df_borriero['S'] = df_borriero[influx]-df_borriero[et]-df_borriero[discharge]+S0
+        df_borriero['S'] = S0 + df_borriero['V']
         w = (df_borriero['S']-df_borriero['S'].min())/(df_borriero['S'].max()-df_borriero['S'].min())
         df_borriero['k'] = k1+(1-w)*(k2-k1)
-        # add spin-up years 2008-2012
-        spinup = pd.concat([df_borriero.loc['2013-02-04':'2015-05-12']]*2, ignore_index=True)
-        newd = pd.date_range(start='2008-07-24', end='2013-02-03', freq='D')
-        spinup.index=newd
+
+        # warm-up: "A 5-year warm-up period (i.e. repetition of the input data) from February 2008
+        # to January 2013". The 828 d record is tiled, so V restarts each cycle instead of
+        # accumulating its -67.5 mm net imbalance once per cycle (-338 mm over the five years).
+        spin_end, spin_start = pd.Timestamp('2013-02-03'), pd.Timestamp('2008-02-01')
+        n_loops = int(np.ceil(((spin_end-spin_start).days+1)/len(df_borriero)))
+        spinup = pd.concat([df_borriero]*n_loops, ignore_index=True)
+        spinup.index = pd.date_range(end=spin_end, periods=len(spinup), freq='D')
+        spinup = spinup.loc[spin_start:]
 
         return df_borriero, spinup, df_borriero, issample, influx, et, discharge, iso_out, iso_in, age_unit
 
@@ -368,6 +468,15 @@ def make_prior_bounds(location):
             "C_old": (-146.71, 29.02),
         }
         return bounds
+    elif location == 'Bruntland Burn':
+        bounds = { # Benettin et al. (2017) Table 1, Model 2 (time-variant Q SAS)
+            "S0": (500, 4000), #(low, high); the paper's "average total storage" Stot
+            "k1": (0.2, 3),    #kQ1, the wet-state exponent
+            "k2": (0.2, 3),    #kQ2, the dry-state exponent
+            "ket": (0.2, 3),
+            "alpha": (0.95, 1.00), #evaporative fractionation factor for ET
+        }
+        return bounds
     elif location == 'Dry Creek':
         bounds = { # for lapides/DryCreek model
             "S0": (60, 270), #(low, high) for 95% CI
@@ -380,10 +489,47 @@ def make_prior_bounds(location):
         return bounds
     elif location == 'Selke':
         bounds = { # for benettin/Selke model
-            "S0": (681, 2875), #(low, high) for 95% CI
-            "k1": (0.4, 0.95),
-            "k2": (0.53, 1.8),
-            "ket": (0.2, 1.95),
+            # Borriero et al. (2023) Table 2 search ranges: S0 300-3000 mm, every SAS parameter
+            # 0.1-2. The commented values are the behavioral ranges instead (Table S1); the text
+            # reports S0 acceptable anywhere in 335-2895 mm and kET unidentifiable over the whole
+            # search range, so expect S0 and ket to stay flat however many samples are drawn.
+            "S0": (300, 3000), #(618, 2875), #(low, high) for 95% CI
+            "k1": (0.2, 2.0), #(0.4, 0.95),
+            "k2": (0.2, 2.0), #(0.53, 1.8),
+            "ket": (0.2, 2.0), #(0.2, 1.95),
+        }
+        return bounds
+    elif location == 'Weierbach (2019)':
+        bounds = { # Rodriguez and Klaus (2019) Table 2 initial ranges. Keys must stay in the order of WEIERBACH_PARAM_NAMES
+            "Sref": (1500, 2500),
+            "Sth": (80, 180),
+            "f0": (0, 1),
+            "dSth": (0.1, 5),
+            "lamda1s": (0, 0.5), #lamda1s + lamda2 > 1 gives negative lamda3; make_SAS_model rejects those
+            "Su": (1, 10),
+            "lamda2": (0, 1),
+            "mu2": (300, 700),
+            "theta2": (0, 200),
+            "mu3": (700, 1750),
+            "theta3": (0, 200),
+            "muET": (300, 1100),
+            "thetaET": (0, 200),
+        }
+        return bounds
+    elif location == 'Weierbach (2021)':
+        bounds = { # Rodriguez et al. (2021) Table 1 initial ranges; Sref fixed at 2000 mm. Keys in the order of WEIERBACH_PARAM_NAMES
+            "Sth": (20, 200),
+            "dSth": (0.1, 20),
+            "Su": (1, 50),
+            "f0": (0, 1),
+            "lamda1s_frac": (0, 1), #"lamda1s is uniformly sampled between 0 and 1-lamda2", so this is lamda1s/(1-lamda2)
+            "lamda2": (0, 1),
+            "mu2": (0, 1600),
+            "theta2": (0, 100),
+            "mu3": (0, 1600),
+            "theta3": (0, 100),
+            "muET": (0, 1600),
+            "thetaET": (0, 100),
         }
         return bounds
     else:
@@ -454,10 +600,13 @@ def make_model(location, data_file_path, spin_up=False, MC=False, validate=False
             
             cols = param_names + ['RMSE','NSE']
             results_df = pd.DataFrame(results, columns=cols)
-            p = results_df.loc[results_df['NSE']==results_df['NSE'].max()] #[251.30273735,   0.71963209,   1.20491725,  27.47813886, 1.2644441 , -46.05504647]
+            p = results_df.loc[results_df['NSE']==results_df['NSE'].max()]
             p = p.to_numpy()
             p = np.delete(p, -1) # take off RMSE column for params
             p = np.delete(p, -1) # take of NSE column
+            print('Best params:')
+            for i in range(len(param_names)):
+                print(f'{param_names[i]}: {p[i]}')
             spin_done = False
             if validate == True:
                 model = make_SAS_model(location, df_val, spinup, spin_done, influx, params=p)
@@ -485,7 +634,11 @@ def make_model(location, data_file_path, spin_up=False, MC=False, validate=False
 
         else: #No MC
             # Run spin-up model to get sT_init and mT_init
-            model = Model(data_df=spinup, config=f'{data_file_path}/../models/{location}_config_spinup.json', influx=influx)
+            if location.startswith('Weierbach'):
+                # the composite SAS weights are data_df columns built from the paper parameters
+                model = make_SAS_model(location, df, spinup, spin_done, influx)
+            else:
+                model = Model(data_df=spinup, config=f'{data_file_path}/../models/{location}_config_spinup.json', influx=influx)
             model.run()
             if len(model.get_mT(iso_in)[:,-1]) < len(df): #CanVilla
                 df['mT_init'] = pd.concat([pd.Series(model.get_mT(iso_in)[:,-1]), pd.Series(np.zeros(len(df)-len(model.get_mT(iso_in)[:,-1])))], ignore_index=True).values
@@ -500,4 +653,44 @@ def make_model(location, data_file_path, spin_up=False, MC=False, validate=False
         model = Model(data_df=df, config=f'{data_file_path}/../models/{location}_config.json', influx=influx)
 
     return model
+
+
+def save_model_run(path, model, issample, **info):
+    """
+    Pickle a model that has been run so it can be reloaded without rerunning the spin-up/MC.
+
+    The whole Model is saved, so the reloaded one keeps data_df (with the predicted
+    '<iso_in> --> <discharge>' columns), options, the recorded-step index and the result arrays,
+    i.e. get_pQ, get_sT, get_mT, ... all work as before. issample is saved with it because some
+    catchments overwrite the one from load_data after the run.
+
+    Parameters:
+    path (str or Path): The .pkl file to write.
+    model (Model): A model that has been run.
+    issample (pd.Series): Boolean mask of the observed samples.
+    **info: Anything else to keep with the run (e.g. spin_up, MC), returned on load.
+    """
+    import pickle
+    from pathlib import Path
+    from datetime import datetime
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    run = {'model': model, 'issample': issample, 'saved': datetime.now().isoformat(timespec='seconds'), **info}
+    with open(path, 'wb') as f:
+        pickle.dump(run, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'Saved model run to {path}')
+
+
+def load_model_run(path):
+    """
+    Reload a model run saved with save_model_run.
+
+    Returns:
+    dict: 'model', 'issample', 'saved' and any extra info given when saving.
+    """
+    import pickle
+    with open(path, 'rb') as f:
+        run = pickle.load(f)
+    print(f"Loaded model run from {path} (saved {run['saved']})")
+    return run
         
